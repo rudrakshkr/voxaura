@@ -9,6 +9,7 @@ export function hiddenOf(scenario: ScenarioRow): HiddenState {
     reservation: scenario.reservation,
     target: scenario.target,
     opening_anchor: scenario.opening_anchor,
+    hiring_urgency: scenario.hiring_urgency,
     flex: scenario.flex,
     persona: scenario.persona,
   };

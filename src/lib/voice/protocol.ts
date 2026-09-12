@@ -45,12 +45,20 @@ export interface SessionResumeMsg {
   session_id: string;
 }
 
+/** Inject a message into the conversation context (used for engine directives). */
+export interface ConversationMessageMsg {
+  type: "conversation.message";
+  role: "user" | "system";
+  content: string;
+}
+
 export type ClientMsg =
   | SessionUpdateMsg
   | InputAudioMsg
   | ToolResultMsg
   | SessionEndMsg
-  | SessionResumeMsg;
+  | SessionResumeMsg
+  | ConversationMessageMsg;
 
 // ---------------------------------------------------------------------------
 // Server → Client

@@ -15,11 +15,13 @@ export const GET = handle(
         strengths: report.strengths ?? [],
         improvements: report.improvements ?? [],
         summary: report.summary,
+        communication: report.communication ?? null,
         transcript: report.transcript ?? [],
         events: events.map((e) => ({
           type: e.type,
           actor: e.actor,
           source: e.source,
+          impact: e.impact,
           payload: e.payload,
           at_ms: e.at_ms,
           seq: e.seq,

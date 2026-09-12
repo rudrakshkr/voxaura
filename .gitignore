@@ -27,3 +27,6 @@ next-env.d.ts
 
 # local tooling
 .freebuff/
+
+# generated repo bundles (repomix)
+repomix-output.xml

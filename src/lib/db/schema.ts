@@ -23,6 +23,7 @@ export const attemptStatusEnum = pgEnum("attempt_status", ["active", "completed"
 export const outcomeEnum = pgEnum("outcome", ["accepted", "rejected", "stalemate", "walked_away"]);
 export const eventActorEnum = pgEnum("event_actor", ["user", "opponent"]);
 export const eventSourceEnum = pgEnum("event_source", ["tool", "llm_extract"]);
+export const eventImpactEnum = pgEnum("event_impact", ["strong", "neutral", "risky"]);
 
 export const MoveTypeEnum = [
   "user_offer",
@@ -34,6 +35,18 @@ export const MoveTypeEnum = [
   "rapport",
   "commitment_signal",
   "interruption",
+  "user_anchor",
+  "opponent_anchor",
+  "counteroffer",
+  "leverage_introduced",
+  "leverage_challenged",
+  "information_request",
+  "information_revealed",
+  "package_trade",
+  "missed_opportunity",
+  "acceptance",
+  "rejection",
+  "walk_away",
 ] as const;
 
 export const scenarios = pgTable("scenarios", {
@@ -50,6 +63,7 @@ export const scenarios = pgTable("scenarios", {
   opening_anchor: integer("opening_anchor").notNull(),
   flex: jsonb("flex").$type<HiddenState["flex"]>().notNull(),
   persona: jsonb("persona").$type<HiddenState["persona"]>().notNull(),
+  hiring_urgency: integer("hiring_urgency").notNull().default(3),
   // User-visible prep material.
   prep_pack: jsonb("prep_pack").$type<PrepPack>().notNull(),
   created_at: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -69,9 +83,12 @@ export const attempts = pgTable(
     effective_hidden: jsonb("effective_hidden").$type<HiddenState | null>(),
     /** Null for a first run; "harder" or "reroll" for retries. */
     retry_mode: text("retry_mode"),
+    /** Server-authoritative negotiation engine state (current offer, granted, counters). */
+    engine_state: jsonb("engine_state").$type<Record<string, unknown>>(),
     status: attemptStatusEnum("status").notNull().default("active"),
     outcome: outcomeEnum("outcome"),
     final_offer: jsonb("final_offer").$type<CompPackage>(),
+    final_conditions: jsonb("final_conditions").$type<string[]>().notNull().default([]),
     started_at: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
     ended_at: timestamp("ended_at", { withTimezone: true }),
   },
@@ -89,6 +106,7 @@ export const negotiationEvents = pgTable(
     type: text("type").notNull(),
     actor: eventActorEnum("actor").notNull(),
     source: eventSourceEnum("source").notNull(),
+    impact: eventImpactEnum("impact").notNull().default("neutral"),
     payload: jsonb("payload").$type<Record<string, unknown>>().notNull().default({}),
     at_ms: integer("at_ms"),
     created_at: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -107,6 +125,7 @@ export const reports = pgTable("reports", {
   strengths: jsonb("strengths").$type<string[]>().notNull(),
   improvements: jsonb("improvements").$type<string[]>().notNull(),
   summary: text("summary").notNull(),
+  communication: jsonb("communication").$type<ReportData["communication"]>(),
   transcript: jsonb("transcript").$type<ReportData["transcript"]>().notNull().default([]),
   created_at: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });

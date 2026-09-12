@@ -6,7 +6,8 @@ import { useRouter } from "next/navigation";
 
 import { OfferMeter } from "./OfferMeter";
 import { TranscriptView } from "./TranscriptView";
-import { fmtTime, Spinner, StatusPill } from "./ui";
+import { VoiceStateBar } from "./VoiceStateBar";
+import { money, Spinner, StatusPill } from "./ui";
 import { useVoiceAgent } from "@/hooks/useVoiceAgent";
 import type { ScenarioPublic } from "@/lib/types";
 
@@ -45,7 +46,8 @@ export function VoiceSession(props: Props) {
             interrupted: t.interrupted,
             at_ms: t.atMs,
           })),
-          outcome: state.acceptedOffer ? "accepted" : state.currentOffer ? "stalemate" : null,
+          // Outcome is server-authoritative; this is only a fallback hint.
+          outcome: null,
         }),
       });
       if (!res.ok) {
@@ -59,16 +61,16 @@ export function VoiceSession(props: Props) {
     } finally {
       completingRef.current = false;
     }
-  }, [props.attemptId, router, state.acceptedOffer, state.currentOffer, state.transcript]);
+  }, [props.attemptId, router, state.transcript]);
 
-  // Auto-complete shortly after the recruiter accepts the candidate's offer.
+  // Auto-complete shortly after the engine validates an acceptance.
   const accepted = state.acceptedOffer != null;
   useEffect(() => {
     if (!accepted) return;
     const t = window.setTimeout(() => {
       end();
       void complete();
-    }, 4000);
+    }, 5000);
     return () => window.clearTimeout(t);
   }, [accepted, complete, end]);
 
@@ -78,14 +80,11 @@ export function VoiceSession(props: Props) {
         <div>
           <p className="text-sm text-white/50">
             {props.scenario.company} · {props.scenario.role}
-            {props.retryMode ? ` · retry (${props.retryMode})` : ""}
+            {props.retryMode ? ` · retry (${props.retryMode === "harder" ? "harder" : "fresh"})` : ""}
           </p>
           <h1 className="text-2xl font-bold">{props.scenario.title}</h1>
         </div>
-        <div className="flex items-center gap-3">
-          <span className="font-mono text-lg">{fmtTime(state.elapsedSec)}</span>
-          <StatusPill status={state.status} />
-        </div>
+        <StatusPill status={state.status} />
       </div>
 
       {state.error && (
@@ -94,6 +93,15 @@ export function VoiceSession(props: Props) {
         </div>
       )}
 
+      <VoiceStateBar
+        status={state.status}
+        userSpeaking={state.userSpeaking}
+        agentSpeaking={state.agentSpeaking}
+        recruiterThinking={state.recruiterThinking}
+        justInterrupted={state.justInterrupted}
+        elapsedSec={state.elapsedSec}
+      />
+
       <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
         <div className="space-y-4">
           <TranscriptView
@@ -101,11 +109,15 @@ export function VoiceSession(props: Props) {
             partialUser={state.partialUser}
             agentSpeaking={state.agentSpeaking}
           />
-          {state.userSpeaking && <p className="text-sm text-violet-300">Listening…</p>}
         </div>
 
         <div className="space-y-4">
-          <OfferMeter currentOffer={state.currentOffer} acceptedOffer={state.acceptedOffer} />
+          <OfferMeter
+            currentOffer={state.currentOffer}
+            acceptedOffer={state.acceptedOffer}
+            conditions={state.offerConditions}
+            previousOffer={null}
+          />
 
           <div className="card space-y-3">
             {state.status === "idle" && (
@@ -165,13 +177,34 @@ export function VoiceSession(props: Props) {
             </Link>
           </div>
 
-          <div className="card">
-            <h3 className="text-sm font-semibold uppercase tracking-wide text-white/50">
-              Coaching objective
-            </h3>
-            <p className="mt-2 text-sm text-white/70">
-              {props.scenario.prep_pack?.coaching_objective}
-            </p>
+          <div className="card space-y-3">
+            <div>
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-white/50">
+                Coaching objective
+              </h3>
+              <p className="mt-2 text-sm text-white/70">
+                {props.scenario.prep_pack?.coaching_objective}
+              </p>
+            </div>
+            <div className="border-t border-white/10 pt-3">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-white/50">
+                Your prep targets
+              </h3>
+              <div className="mt-2 flex gap-6 text-sm">
+                <div>
+                  <p className="text-xs text-white/40">Target</p>
+                  <p className="font-mono text-violet-300">
+                    {money(props.scenario.prep_pack?.your_target ?? null)}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-white/40">Walk away below</p>
+                  <p className="font-mono text-white/80">
+                    {money(props.scenario.prep_pack?.your_reservation ?? null)}
+                  </p>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </div>

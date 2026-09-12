@@ -15,6 +15,7 @@ export const GET = handle(async () => {
       retry_mode: r.attempt.retry_mode,
       final_base: r.attempt.final_offer?.base ?? null,
       score: r.score,
+      previous_score: r.previousScore,
       started_at: r.attempt.started_at.toISOString(),
     })),
   });

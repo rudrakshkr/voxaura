@@ -41,25 +41,24 @@ export const POST = handle(
     if (!body.success) throw new ApiError(400, "Invalid completion payload");
 
     const { attempt, scenario } = await getAttemptWithScenario(id);
-    const { effectiveHidden } = hydrateAttempt(attempt, scenario);
 
-    // 1. Freeze outcome + final offer from the client if provided; otherwise
-    //    fall back to the last opponent acceptance event.
+    // 1. Outcome is SERVER-AUTHORITATIVE: the engine finalizes acceptances.
+    //    Client hints only fill gaps (walk-away detection when the engine
+    //    never accepted and the candidate explicitly rejected).
     const events = await listEvents(id);
-    let outcome = body.data.outcome ?? null;
-    let finalOffer = attempt.final_offer ?? null;
+    let outcome = attempt.outcome ?? body.data.outcome ?? null;
+    const finalOffer = attempt.final_offer ?? null;
     if (!outcome) {
-      const accepted = [...events]
+      const engineAccepted = [...events]
         .reverse()
-        .find((e) => e.type === "commitment_signal" && e.actor === "opponent");
-      if (accepted) {
+        .find((e) => e.type === "acceptance" && e.actor === "opponent");
+      if (engineAccepted) {
         outcome = "accepted";
-        const p = accepted.payload as { final_base?: number; sign_on?: number; equity?: number };
-        finalOffer =
-          finalOffer ??
-          (p.final_base
-            ? { base: p.final_base, sign_on: p.sign_on ?? null, equity: p.equity ?? null }
-            : null);
+      } else {
+        const walked = [...events].reverse().find(
+          (e) => e.type === "walk_away" && e.actor === "user",
+        );
+        if (walked) outcome = "walked_away";
       }
     }
 
@@ -85,7 +84,8 @@ export const POST = handle(
       }
     }
 
-    // 3. Score.
+    // 3. Score with full evidence (engine state + hidden economics).
+    const { effectiveHidden } = hydrateAttempt(attempt, scenario);
     const report = await scoreAttempt({
       transcript,
       liveEvents: events.map((e) => ({
@@ -98,7 +98,9 @@ export const POST = handle(
       })),
       hidden: effectiveHidden,
       prepObjective: scenario.prep_pack?.coaching_objective,
-      sessionDurationSec: null,
+      finalOffer,
+      outcome,
+      openingOfferBase: effectiveHidden.opening_anchor,
     });
 
     // 4. Persist report + any extracted events the scorer recovered.

@@ -10,6 +10,7 @@ import {
   type VoiceAgentEvent,
 } from "@/lib/voice/protocol";
 import type { BatchedEvent, CompPackage, TranscriptTurn } from "@/lib/types";
+import type { TurnDirective } from "@/lib/negotiation-engine";
 
 export type AgentStatus =
   | "idle"
@@ -27,8 +28,14 @@ export interface VoiceAgentState {
   partialUser: string | null;
   userSpeaking: boolean;
   agentSpeaking: boolean;
+  /** "thinking" = user finished, recruiter reply in flight. */
+  recruiterThinking: boolean;
+  /** True right after the user barged in; clears on the next recruiter turn. */
+  justInterrupted: boolean;
+  /** Authoritative package: set ONLY by server-validated offers/acceptances. */
   currentOffer: CompPackage | null;
   acceptedOffer: CompPackage | null;
+  offerConditions: string[];
   elapsedSec: number;
 }
 
@@ -55,8 +62,11 @@ export function useVoiceAgent(args: {
     partialUser: null,
     userSpeaking: false,
     agentSpeaking: false,
+    recruiterThinking: false,
+    justInterrupted: false,
     currentOffer: null,
     acceptedOffer: null,
+    offerConditions: [],
     elapsedSec: 0,
   });
 
@@ -78,6 +88,10 @@ export function useVoiceAgent(args: {
 
   // Event batch queue for the attempts API.
   const eventQueueRef = useRef<BatchedEvent[]>([]);
+
+  // Turn relay: last user utterance queued until its agent reply completes.
+  const pendingTurnRef = useRef<{ text: string; interrupted: boolean } | null>(null);
+  const turnInFlightRef = useRef(false);
 
   const mic = useMicCapture();
   const playback = usePcmPlayback();
@@ -128,7 +142,11 @@ export function useVoiceAgent(args: {
           sign_on: num(args.sign_on),
           equity: num(args.equity),
         };
-        patch({ currentOffer: offer });
+        const conditions = String(args.notes ?? "")
+          .split(/[.;]\s*/)
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0);
+        patch({ currentOffer: offer, offerConditions: conditions });
         queueEvent({
           type: "opponent_offer",
           actor: "opponent",
@@ -195,6 +213,64 @@ export function useVoiceAgent(args: {
       wsRef.current.send(JSON.stringify(msg));
     }
   }, []);
+
+  // ---------------------------------------------------------------------------
+  // Turn relay: user utterance → server engine → directive → agent
+  // ---------------------------------------------------------------------------
+
+  const dispatchTurn = useCallback(
+    async (text: string, interrupted: boolean) => {
+      if (turnInFlightRef.current) return;
+      turnInFlightRef.current = true;
+      patch({ recruiterThinking: true });
+      try {
+        const res = await fetch(`/api/attempts/${argsRef.current.attemptId}/turn`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_text: text, user_interrupted: interrupted }),
+        });
+        if (!res.ok) return; // engine hiccup must never break the live call
+        const data = (await res.json()) as { directive: TurnDirective };
+        const d = data.directive;
+        if (!d) return;
+
+        const lines: string[] = [`SYSTEM DIRECTIVE (obey exactly): ${d.verdict}`];
+        if (d.allowedNumbers.length > 0) {
+          lines.push(
+            `ALLOWED NUMBERS this turn (you may say ONLY these, exactly as written): ${d.allowedNumbers.join(", ")}.`,
+          );
+        } else {
+          lines.push("ALLOWED NUMBERS: none. Do not speak any dollar figures this turn.");
+        }
+        for (const m of d.mustSay) lines.push(`DO: ${m}`);
+        for (const m of d.mustNotSay) lines.push(`DO NOT: ${m}`);
+        if (d.conditions.length > 0) lines.push(`CONDITIONS to state: ${d.conditions.join("; ")}.`);
+        if (d.askUserQuestion) lines.push(`ASK the candidate: "${d.askUserQuestion}"`);
+        if (d.toolHint?.accept) {
+          lines.push(
+            `CALL accept_user_offer with exactly: ${JSON.stringify(d.toolHint.offer)}.`,
+          );
+        } else if (d.toolHint?.offer) {
+          lines.push(
+            `CALL offer_to_candidate with exactly: ${JSON.stringify(d.toolHint.offer)} and any conditions in notes.`,
+          );
+        }
+
+        send({ type: "conversation.message", role: "system", content: lines.join("\n") });
+      } finally {
+        turnInFlightRef.current = false;
+      }
+    },
+    [patch, send],
+  );
+
+  const maybeDispatchPendingTurn = useCallback(() => {
+    const pending = pendingTurnRef.current;
+    if (pending && !turnInFlightRef.current) {
+      pendingTurnRef.current = null;
+      void dispatchTurn(pending.text, pending.interrupted);
+    }
+  }, [dispatchTurn]);
 
   const flushPendingTools = useCallback(() => {
     const pending = pendingToolsRef.current;
@@ -341,11 +417,13 @@ export function useVoiceAgent(args: {
               partialUser: null,
               transcript: [...s.transcript, turn],
             }));
+            // Queue for the engine; dispatched when the recruiter's reply ends.
+            pendingTurnRef.current = { text: event.text, interrupted: false };
             break;
           }
 
           case "reply.started": {
-            patch({ agentSpeaking: true });
+            patch({ agentSpeaking: true, recruiterThinking: false });
             break;
           }
 
@@ -363,6 +441,7 @@ export function useVoiceAgent(args: {
             };
             setState((s) => ({ ...s, transcript: [...s.transcript, turn] }));
             if (event.interrupted) {
+              patch({ justInterrupted: true });
               queueEvent({
                 type: "interruption",
                 actor: "user",
@@ -375,12 +454,14 @@ export function useVoiceAgent(args: {
           }
 
           case "reply.done": {
-            patch({ agentSpeaking: false });
+            patch({ agentSpeaking: false, recruiterThinking: false });
             if (event.status === "interrupted") {
               playback.flush();
               pendingToolsRef.current = []; // agent moved on; drop stale results
             } else {
               flushPendingTools();
+              // User's turn just completed → run the negotiation engine now.
+              maybeDispatchPendingTurn();
             }
             break;
           }
@@ -411,7 +492,7 @@ export function useVoiceAgent(args: {
         }
       }
     },
-    [flushPendingTools, mic, patch, playback, queueEvent, runTool, send],
+    [flushPendingTools, mic, maybeDispatchPendingTurn, patch, playback, queueEvent, runTool, send],
   );
 
   // ---------------------------------------------------------------------------
@@ -469,6 +550,13 @@ export function useVoiceAgent(args: {
     const t = window.setInterval(() => void flushEvents(), 5000);
     return () => window.clearInterval(t);
   }, [state.status, flushEvents]);
+
+  // Clear the interrupted flag when the user speaks again.
+  useEffect(() => {
+    if (state.userSpeaking && state.justInterrupted) {
+      patch({ justInterrupted: false });
+    }
+  }, [state.userSpeaking, state.justInterrupted, patch]);
 
   // Cleanup on unmount.
   useEffect(() => {

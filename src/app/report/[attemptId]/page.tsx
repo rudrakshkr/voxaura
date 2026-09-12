@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 
+import { NegotiationTimeline } from "@/components/NegotiationTimeline";
 import { money, ScoreRing, Spinner } from "@/components/ui";
 import type { ReportData } from "@/lib/types";
 
@@ -14,6 +15,7 @@ interface AttemptDetail {
     status: string;
     outcome: string | null;
     final_offer: { base: number; sign_on: number | null; equity: number | null } | null;
+    final_conditions: string[] | null;
     retry_mode: string | null;
   };
   scenario: { id: string; title: string; company: string; role: string };
@@ -22,13 +24,16 @@ interface AttemptDetail {
 
 const DIMENSION_LABELS: Record<string, string> = {
   anchoring: "Anchoring",
+  leverage: "Leverage",
+  information_control: "Information control",
+  concession_management: "Concession management",
+  outcome: "Outcome",
+  // legacy dimensions (older reports) still render correctly
   information_gathering: "Information gathering",
   justification: "Justification & leverage",
-  concession_management: "Concession management",
   package_creativity: "Package creativity",
   composure: "Composure & rapport",
-  information_control: "Information control",
-  outcome: "Outcome vs. achievable",
+  outcome_vs_achievable: "Outcome vs. achievable",
 };
 
 export default function ReportPage() {
@@ -135,6 +140,20 @@ export default function ReportPage() {
           <div className="grid gap-6 md:grid-cols-[auto_1fr]">
             <div className="card flex flex-col items-center justify-center gap-2">
               <ScoreRing score={report.overall_score} />
+              {prevScore != null && (
+                <p
+                  className={
+                    report.overall_score >= prevScore
+                      ? "text-sm font-semibold text-emerald-300"
+                      : "text-sm font-semibold text-red-300"
+                  }
+                >
+                  {prevScore} → {report.overall_score} ({
+                    report.overall_score - prevScore >= 0 ? "+" : ""
+                  }
+                  {report.overall_score - prevScore} pts)
+                </p>
+              )}
               <p className="text-sm font-semibold">
                 {report.outcome ? report.outcome.replace("_", " ") : "scored"}
               </p>
@@ -202,6 +221,17 @@ export default function ReportPage() {
             </div>
           </section>
 
+          <section className="card">
+            <h2 className="font-semibold">Negotiation timeline</h2>
+            <p className="mt-1 text-xs text-white/40">
+              Strong moves are green, risky moves amber. Every entry is what actually happened on
+              the call.
+            </p>
+            <div className="mt-5">
+              <NegotiationTimeline events={report.events ?? []} />
+            </div>
+          </section>
+
           <div className="grid gap-6 md:grid-cols-2">
             <section className="card">
               <h2 className="font-semibold">Transcript</h2>
@@ -227,33 +257,25 @@ export default function ReportPage() {
             </section>
 
             <section className="card">
-              <h2 className="font-semibold">Moves detected</h2>
-              <div className="mt-3 max-h-80 space-y-2 overflow-y-auto pr-1">
-                {(report.events?.length ?? 0) === 0 && (
-                  <p className="text-sm text-white/40">No negotiation events were detected.</p>
-                )}
-                {(report.events ?? []).map((e, i) => (
-                  <div key={i} className="flex items-start gap-2 text-sm">
-                    <span
-                      className={
-                        e.actor === "user"
-                          ? "rounded bg-violet-600/30 px-1.5 py-0.5 text-xs text-violet-200"
-                          : "rounded bg-white/10 px-1.5 py-0.5 text-xs text-white/70"
-                      }
-                    >
-                      {e.actor}
-                    </span>
-                    <span className="text-white/70">
-                      {e.type.replace(/_/g, " ")}
-                      {typeof e.payload?.amount === "number" &&
-                        ` · ${money(e.payload.amount)}`}
-                      {typeof e.payload?.note === "string" && e.payload.note
-                        ? ` — ${e.payload.note}`
-                        : ""}
-                    </span>
+              <h2 className="font-semibold">Communication</h2>
+              <p className="mt-1 text-xs text-white/40">
+                Qualitative only — this does not affect your score.
+              </p>
+              <dl className="mt-4 space-y-3 text-sm">
+                {(
+                  [
+                    ["Clarity", report.communication?.clarity],
+                    ["Confidence", report.communication?.confidence],
+                    ["Composure", report.communication?.composure],
+                    ["Rapport", report.communication?.rapport],
+                  ] as const
+                ).map(([label, value]) => (
+                  <div key={label}>
+                    <dt className="font-medium text-white/70">{label}</dt>
+                    <dd className="text-white/55">{value ?? "—"}</dd>
                   </div>
                 ))}
-              </div>
+              </dl>
             </section>
           </div>
         </>
@@ -262,14 +284,14 @@ export default function ReportPage() {
       <section className="card flex flex-wrap items-center gap-3">
         <h2 className="w-full font-semibold">Run it again?</h2>
         <button className="btn btn-primary" disabled={retrying} onClick={() => void retry("reroll")}>
-          {retrying ? <Spinner /> : "🔁"} Retry (fresh numbers)
+          {retrying ? <Spinner /> : "🔁"} Retry — same scenario, fresh conversation
         </button>
         <button
           className="btn btn-ghost"
           disabled={retrying}
           onClick={() => void retry("harder")}
         >
-          🔥 Retry harder (firmer recruiter)
+          🔥 Retry harder — same numbers, tougher recruiter
         </button>
         <Link href="/history" className="btn btn-ghost">
           View history

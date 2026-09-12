@@ -108,9 +108,36 @@ export default function ScenarioPrepPage() {
             </ul>
           </section>
 
-          <section className="card space-y-2 border-violet-500/30 bg-violet-500/5">
-            <h2 className="font-semibold">Your coaching objective</h2>
+          <section className="card space-y-3 border-violet-500/30 bg-violet-500/5">
+            <h2 className="font-semibold">Your briefing</h2>
             <p className="text-white/70">{scenario.prep_pack.coaching_objective}</p>
+            {scenario.prep_pack.your_target != null && (
+              <div className="flex gap-8 pt-1">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-white/40">Your target</p>
+                  <p className="font-mono text-lg text-violet-300">
+                    {scenario.prep_pack.your_target.toLocaleString("en-US", {
+                      style: "currency",
+                      currency: "USD",
+                      maximumFractionDigits: 0,
+                    })}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-white/40">Walk away below</p>
+                  <p className="font-mono text-lg text-white/80">
+                    {scenario.prep_pack.your_reservation?.toLocaleString("en-US", {
+                      style: "currency",
+                      currency: "USD",
+                      maximumFractionDigits: 0,
+                    })}
+                  </p>
+                </div>
+              </div>
+            )}
+            <p className="text-xs text-white/35">
+              These are your goals — the recruiter has their own, and they won&apos;t share them.
+            </p>
           </section>
         </div>
 

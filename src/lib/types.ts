@@ -13,7 +13,10 @@ export type Outcome = z.infer<typeof Outcome>;
 export const AttemptStatus = z.enum(["active", "completed", "abandoned"]);
 export type AttemptStatus = z.infer<typeof AttemptStatus>;
 
-/** Move taxonomy — the vocabulary of negotiation events (plan §4, §7). */
+/**
+ * Move taxonomy — the vocabulary of negotiation events.
+ * Layer-1 (tool/heuristic, live) and layer-2 (LLM extract) share this space.
+ */
 export const MoveType = z.enum([
   "user_offer",
   "opponent_offer",
@@ -24,8 +27,25 @@ export const MoveType = z.enum([
   "rapport",
   "commitment_signal",
   "interruption",
+  // richer, evidence-oriented event types (spec §8)
+  "user_anchor",
+  "opponent_anchor",
+  "counteroffer",
+  "leverage_introduced",
+  "leverage_challenged",
+  "information_request",
+  "information_revealed",
+  "package_trade",
+  "missed_opportunity",
+  "acceptance",
+  "rejection",
+  "walk_away",
 ]);
 export type MoveType = z.infer<typeof MoveType>;
+
+/** Visual severity used by the timeline: strong / neutral / risky. */
+export const EventImpact = z.enum(["strong", "neutral", "risky"]);
+export type EventImpact = z.infer<typeof EventImpact>;
 
 export const EventActor = z.enum(["user", "opponent"]);
 export type EventActor = z.infer<typeof EventActor>;
@@ -71,6 +91,8 @@ export const HiddenState = z.object({
     start_date_weeks: z.number().int().nullish(),
     extra_pto_days: z.number().int().nullish(),
   }),
+  /** 1 = desperate to fill the seat, 5 = leisurely; drives recruiter patience. */
+  hiring_urgency: z.number().int().min(1).max(5).default(3),
   persona: z.object({
     name: z.string(),
     title: z.string(),
@@ -96,6 +118,10 @@ export const PrepPack = z.object({
   /** Comp components the candidate is told exist (names + rough ranges). */
   comp_notes: z.array(z.string()),
   coaching_objective: z.string(),
+  /** What a strong candidate should aim for (prep guidance, NOT the opponent's hidden state). */
+  your_target: z.number().int(),
+  /** Below this the candidate should walk (prep guidance). */
+  your_reservation: z.number().int(),
 });
 export type PrepPack = z.infer<typeof PrepPack>;
 
@@ -123,7 +149,7 @@ export const NegotiationEvent = z.object({
   type: MoveType,
   actor: EventActor,
   source: EventSource,
-  /** e.g. { amount?: number, package?: CompPackage, note?: string, tactic?: string } */
+  /** e.g. { amount?, package?, note?, condition?, leverage?, quote? } */
   payload: z.record(z.string(), z.unknown()).default({}),
   /** Millisecond offset into the session when it happened. */
   at_ms: z.number().int().min(0).nullish(),
@@ -149,6 +175,15 @@ export const ReportData = z.object({
   strengths: z.array(z.string()),
   improvements: z.array(z.string()),
   summary: z.string(),
+  /** Qualitative communication feedback — never weighted into the score. */
+  communication: z
+    .object({
+      clarity: z.string(),
+      confidence: z.string(),
+      composure: z.string(),
+      rapport: z.string(),
+    })
+    .nullish(),
   outcome: Outcome.nullish(),
   final_offer: CompPackage.nullish(),
   events: z.array(NegotiationEvent).default([]),

@@ -144,6 +144,31 @@ export async function markAbandoned(id: string): Promise<void> {
     .where(eq(attempts.id, id));
 }
 
+export async function setAttemptEngineState(
+  id: string,
+  engineState: Record<string, unknown>,
+): Promise<void> {
+  await db.update(attempts).set({ engine_state: engineState }).where(eq(attempts.id, id));
+}
+
+/** Server-authoritative acceptance: only the engine may finalize the deal. */
+export async function setAttemptOutcomeIfAccepted(
+  id: string,
+  finalOffer: CompPackage,
+  conditions: string[],
+): Promise<void> {
+  await db
+    .update(attempts)
+    .set({
+      outcome: "accepted",
+      final_offer: finalOffer,
+      final_conditions: conditions,
+      status: "completed",
+      ended_at: new Date(),
+    })
+    .where(eq(attempts.id, id));
+}
+
 /** Next monotonic seq for an attempt's events. */
 export async function nextEventSeq(attemptId: string): Promise<number> {
   const [row] = await db
@@ -218,6 +243,7 @@ export async function saveReport(
     strengths: string[];
     improvements: string[];
     summary: string;
+    communication?: unknown;
     transcript: unknown;
   },
 ): Promise<void> {
@@ -228,6 +254,7 @@ export async function saveReport(
     strengths: report.strengths,
     improvements: report.improvements,
     summary: report.summary,
+    communication: (report.communication ?? null) as never,
     transcript: report.transcript as never,
   });
 }
@@ -237,6 +264,8 @@ export async function listHistory(): Promise<
     attempt: AttemptRow;
     scenarioTitle: string;
     score: number | null;
+    /** Overall score of the user's PREVIOUS attempt on the same scenario. */
+    previousScore: number | null;
   }>
 > {
   const rows = await db
@@ -246,9 +275,23 @@ export async function listHistory(): Promise<
     .leftJoin(reports, eq(reports.attempt_id, attempts.id))
     .orderBy(desc(attempts.started_at))
     .limit(100);
-  return rows.map((r) => ({
+
+  // Previous attempt = the user's most recent earlier SCORED attempt on the
+  // same scenario (this is what "72 → 84" compares against). Rows arrive
+  // newest-first, so the last score seen per scenario is the previous one.
+  const lastScoreByScenario = new Map<string, number>();
+  const enriched = rows.map((r) => {
+    const sid = r.attempt.scenario_id;
+    const previousScore = lastScoreByScenario.get(sid) ?? null;
+    if (r.report?.overall_score != null) {
+      lastScoreByScenario.set(sid, r.report.overall_score);
+    }
+    return { ...r, previousScore };
+  });
+  return enriched.map((r) => ({
     attempt: r.attempt,
     scenarioTitle: r.scenario.title,
     score: r.report?.overall_score ?? null,
+    previousScore: r.previousScore,
   }));
 }

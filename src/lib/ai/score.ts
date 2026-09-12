@@ -11,7 +11,7 @@ import type {
 } from "../types";
 import { MoveTypeEnum } from "../db/schema";
 
-import { callJson, LlmUnavailableError } from "./llm";
+import { callJson } from "./llm";
 import { buildScorerPrompt } from "./prompts";
 
 // ---------------------------------------------------------------------------
@@ -26,18 +26,26 @@ const EventOut = z.object({
 });
 
 const ScorerOut = z.object({
-  overall_score: z.number(),
+  overall_score: z.number().nullish(),
   rubric: z.array(
     z.object({
       dimension: z.string(),
       score: z.number(),
-      weight: z.number().nullish(),
-      feedback: z.string(),
+      feedback: z.string().default(""),
     }),
   ),
   strengths: z.array(z.string()),
   improvements: z.array(z.string()),
-  summary: z.string(),
+  // Lenient: small models in json_object mode sometimes drop optional-ish fields.
+  summary: z.string().default(""),
+  communication: z
+    .object({
+      clarity: z.string().default(""),
+      confidence: z.string().default(""),
+      composure: z.string().default(""),
+      rapport: z.string().default(""),
+    })
+    .nullish(),
   outcome: z.string().nullish(),
   final_offer: z
     .object({
@@ -50,15 +58,18 @@ const ScorerOut = z.object({
 });
 
 const DIMENSION_WEIGHTS: Record<string, number> = {
-  anchoring: 0.15,
-  information_gathering: 0.1,
-  justification: 0.15,
-  concession_management: 0.15,
-  package_creativity: 0.1,
-  composure: 0.1,
-  information_control: 0.1,
-  outcome: 0.15,
+  anchoring: 0.2,
+  leverage: 0.2,
+  information_control: 0.2,
+  concession_management: 0.2,
+  outcome: 0.2,
 };
+
+/** Weight for a rubric dimension, tolerant of display-name variants. */
+function dimensionWeight(dimension: string): number {
+  const key = dimension.toLowerCase().replace(/\s+/g, "_");
+  return DIMENSION_WEIGHTS[key] ?? 0.2;
+}
 
 function coerceOutcome(v: string | null | undefined): Outcome | null {
   if (v === "accepted" || v === "rejected" || v === "stalemate" || v === "walked_away") return v;
@@ -69,24 +80,32 @@ function coerceOutcome(v: string | null | undefined): Outcome | null {
 // Deterministic fallback (AI_DEBUG=1)
 // ---------------------------------------------------------------------------
 
-export function debugReport(transcript: TranscriptTurn[], liveEvents: NegotiationEvent[]): ReportData {
+export function debugReport(
+  transcript: TranscriptTurn[],
+  liveEvents: NegotiationEvent[],
+  finalOffer: CompPackage | null,
+  outcome: Outcome | null,
+): ReportData {
   return {
     overall_score: 72,
     rubric: [
-      { dimension: "anchoring", score: 7, weight: 0.15, feedback: "Debug score." },
-      { dimension: "information_gathering", score: 6, weight: 0.1, feedback: "Debug score." },
-      { dimension: "justification", score: 7, weight: 0.15, feedback: "Debug score." },
-      { dimension: "concession_management", score: 8, weight: 0.15, feedback: "Debug score." },
-      { dimension: "package_creativity", score: 7, weight: 0.1, feedback: "Debug score." },
-      { dimension: "composure", score: 8, weight: 0.1, feedback: "Debug score." },
-      { dimension: "information_control", score: 7, weight: 0.1, feedback: "Debug score." },
-      { dimension: "outcome", score: 6, weight: 0.15, feedback: "Debug score." },
+      { dimension: "anchoring", score: 7, weight: 0.2, feedback: "Debug score — add API keys for evidence-based coaching." },
+      { dimension: "leverage", score: 6, weight: 0.2, feedback: "Debug score." },
+      { dimension: "information_control", score: 7, weight: 0.2, feedback: "Debug score." },
+      { dimension: "concession_management", score: 7, weight: 0.2, feedback: "Debug score." },
+      { dimension: "outcome", score: 6, weight: 0.2, feedback: "Debug score." },
     ],
     strengths: ["Debug mode: strengths are placeholders."],
     improvements: ["Debug mode: improvements are placeholders."],
+    communication: {
+      clarity: "Debug placeholder.",
+      confidence: "Debug placeholder.",
+      composure: "Debug placeholder.",
+      rapport: "Debug placeholder.",
+    },
     summary: "Debug-mode report generated without any LLM calls.",
-    outcome: "stalemate",
-    final_offer: null,
+    outcome: outcome ?? "stalemate",
+    final_offer: finalOffer,
     events: liveEvents,
     transcript: transcript.map((t) => ({
       role: t.role,
@@ -106,45 +125,65 @@ export interface ScoreInput {
   liveEvents: NegotiationEvent[];
   hidden: HiddenState;
   prepObjective?: string;
-  sessionDurationSec?: number | null;
+  /** Server-authoritative final package (engine state), if any. */
+  finalOffer: CompPackage | null;
+  /** Server-authoritative outcome, if known. */
+  outcome: Outcome | null;
+  openingOfferBase: number;
 }
 
 export async function scoreAttempt(input: ScoreInput): Promise<ReportData> {
   if (env().AI_DEBUG) {
-    return debugReport(input.transcript, input.liveEvents);
+    return debugReport(input.transcript, input.liveEvents, input.finalOffer, input.outcome);
   }
 
   const transcriptText = input.transcript
-    .map((t) => `${t.role === "user" ? "CANDIDATE" : "RECRUITER"}: ${t.text}`)
+    .map(
+      (t, i) =>
+        `${t.role === "user" ? "CANDIDATE" : "RECRUITER"} [${i}]: ${t.text}${
+          t.interrupted ? " (interrupted)" : ""
+        }`,
+    )
     .join("\n");
 
   const liveEventsText = input.liveEvents
     .map(
       (e) =>
-        `- [${e.source}] ${e.actor} ${e.type} ${JSON.stringify(e.payload)}${
-          e.at_ms != null ? ` @${e.at_ms}ms` : ""
+        `- [${e.source}] ${e.actor} ${e.type}${
+          e.payload.amount != null ? ` $${e.payload.amount}` : ""
+        }${e.payload.package ? ` pkg=${JSON.stringify(e.payload.package)}` : ""}${
+          e.payload.note ? ` — ${String(e.payload.note).slice(0, 120)}` : ""
         }`,
     )
     .join("\n");
 
-  const userPrompt = `
-## Rubric spec
-${Object.entries(DIMENSION_WEIGHTS)
-  .map(([dim, w]) => `${dim}: weight ${w}`)
-  .join("\n")}
+  const finalPkg = input.finalOffer
+    ? `base $${input.finalOffer.base.toLocaleString()}${
+        input.finalOffer.sign_on ? `, sign-on $${input.finalOffer.sign_on.toLocaleString()}` : ""
+      }${input.finalOffer.equity ? `, equity $${input.finalOffer.equity.toLocaleString()}/yr` : ""}`
+    : "no final package was agreed";
 
-## Hidden recruiter state (for grading what was achievable)
+  const userPrompt = `
+## Hidden recruiter state (for judging what was achievable — never reveal to the candidate)
 budget=${input.hidden.budget} reservation=${input.hidden.reservation} target=${input.hidden.target} opening_anchor=${input.hidden.opening_anchor}
-flex=${JSON.stringify(input.hidden.flex)}
+
+## Recruiter's opening offer
+base $${input.openingOfferBase.toLocaleString()}
+
+## Final package (server-verified)
+${finalPkg}
+
+## Outcome (server-verified)
+${input.outcome ?? "not set"}
 
 ${input.prepObjective ? `## Coaching objective for this scenario\n${input.prepObjective}\n` : ""}
-## Live-captured negotiation events
+## Canonical event timeline (detected live)
 ${liveEventsText || "(none captured)"}
 
-## Transcript
+## Full transcript
 ${transcriptText || "(empty call)"}
 
-Score the call now. Respond with JSON only.
+Score the CANDIDATE now. Every dimension feedback MUST cite or closely paraphrase a specific candidate moment from the transcript. Respond with JSON only.
 `.trim();
 
   const { content: raw, provider } = await callJson({
@@ -160,6 +199,7 @@ Score the call now. Respond with JSON only.
         "strengths",
         "improvements",
         "summary",
+        "communication",
         "outcome",
         "final_offer",
         "events",
@@ -182,6 +222,17 @@ Score the call now. Respond with JSON only.
         strengths: { type: "array", items: { type: "string" } },
         improvements: { type: "array", items: { type: "string" } },
         summary: { type: "string" },
+        communication: {
+          type: "object",
+          additionalProperties: false,
+          required: ["clarity", "confidence", "composure", "rapport"],
+          properties: {
+            clarity: { type: "string" },
+            confidence: { type: "string" },
+            composure: { type: "string" },
+            rapport: { type: "string" },
+          },
+        },
         outcome: { type: "string", enum: ["accepted", "rejected", "stalemate", "walked_away", "unknown"] },
         final_offer: {
           oneOf: [
@@ -216,10 +267,28 @@ Score the call now. Respond with JSON only.
     },
   });
   console.info(`[score] report generated via ${provider}`);
-  const out = ScorerOut.parse(JSON.parse(raw));
 
-  // Merge live events with extracted ones (live first, extracted appended with
-  // source llm_extract). Dedupe near-identical user offers on amount.
+  // Defensive: repair-tolerant parse (small models sometimes drop fields).
+  const parsedJson = JSON.parse(raw) as Record<string, unknown>;
+  const out = ScorerOut.parse({
+    strengths: [],
+    improvements: [],
+    rubric: [],
+    ...parsedJson,
+  });
+  // Ensure every rubric dimension required by the report exists.
+  const requiredDims = ["Anchoring", "Leverage", "Information Control", "Concession Management", "Outcome"];
+  for (const dim of requiredDims) {
+    if (!out.rubric.some((d) => d.dimension.toLowerCase().includes(dim.toLowerCase().split(" ")[0]))) {
+      out.rubric.push({
+        dimension: dim,
+        score: 5,
+        feedback: "Not assessed by the scorer model; defaulted to neutral.",
+      });
+    }
+  }
+
+  // Merge live events with extracted ones (live first, extracted appended).
   const merged: NegotiationEvent[] = [...input.liveEvents];
   for (const e of out.events) {
     const type = MoveTypeEnum.includes(e.type as never) ? (e.type as NegotiationEvent["type"]) : null;
@@ -245,28 +314,39 @@ Score the call now. Respond with JSON only.
     });
   }
 
-  const finalOffer: CompPackage | null = out.final_offer
-    ? {
-        base: Math.round(out.final_offer.base),
-        sign_on: out.final_offer.sign_on != null ? Math.round(out.final_offer.sign_on) : null,
-        equity: out.final_offer.equity != null ? Math.round(out.final_offer.equity) : null,
-      }
-    : null;
+  const finalOffer: CompPackage | null =
+    input.finalOffer ??
+    (out.final_offer
+      ? {
+          base: Math.round(out.final_offer.base),
+          sign_on: out.final_offer.sign_on != null ? Math.round(out.final_offer.sign_on) : null,
+          equity: out.final_offer.equity != null ? Math.round(out.final_offer.equity) : null,
+        }
+      : null);
 
   const rubric = out.rubric.map((r) => ({
     dimension: r.dimension,
     score: Math.max(0, Math.min(10, r.score)),
-    weight: r.weight ?? DIMENSION_WEIGHTS[r.dimension] ?? 0.1,
+    weight: dimensionWeight(r.dimension),
     feedback: r.feedback,
   }));
 
+  // Overall: model-provided when present, otherwise computed from the rubric
+  // (each dimension is 0–10 → average × 10 = 0–100).
+  const overall =
+    out.overall_score ??
+    (rubric.length
+      ? Math.round((rubric.reduce((s, d) => s + d.score, 0) / rubric.length) * 10)
+      : 0);
+
   return {
-    overall_score: Math.max(0, Math.min(100, Math.round(out.overall_score))),
+    overall_score: Math.max(0, Math.min(100, Math.round(overall))),
     rubric,
     strengths: out.strengths,
     improvements: out.improvements,
+    communication: out.communication ?? null,
     summary: out.summary,
-    outcome: coerceOutcome(out.outcome),
+    outcome: input.outcome ?? coerceOutcome(out.outcome),
     final_offer: finalOffer,
     events: merged,
     transcript: input.transcript.map((t) => ({

@@ -64,9 +64,10 @@ export default function Home() {
           against a voice that talks back.
         </h1>
         <p className="max-w-2xl text-white/60">
-          A realistic AI recruiter calls you with an offer and hidden constraints. Negotiate out
-          loud, in real time. When it ends, get a scored report on your anchoring, concessions, and
-          composure — then run it again, harder.
+          Speak naturally with an adaptive recruiter who has a private budget, a real personality,
+          and instructions to protect it. Push too hard and they hold firm. Bring real leverage and
+          they counter. Then get evidence-based coaching on every move you made — and retry the
+          same negotiation until you win it.
         </p>
       </header>
 

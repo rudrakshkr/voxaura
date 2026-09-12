@@ -14,6 +14,8 @@ interface HistoryRow {
   retry_mode: string | null;
   final_base: number | null;
   score: number | null;
+  /** Score of the user's previous attempt on the SAME scenario (server-computed). */
+  previous_score: number | null;
   started_at: string;
 }
 
@@ -63,10 +65,11 @@ export default function HistoryPage() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r, idx) => {
-                const prev = rows[idx + 1];
+              {rows.map((r) => {
                 const delta =
-                  r.score != null && prev?.score != null ? r.score - prev.score : null;
+                  r.score != null && r.previous_score != null
+                    ? r.score - r.previous_score
+                    : null;
                 return (
                   <tr key={r.attempt_id} className="border-b border-white/5">
                     <td className="py-2 pr-4 text-white/50">

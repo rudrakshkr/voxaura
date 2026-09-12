@@ -3,7 +3,7 @@ import { z } from "zod";
 import { env } from "../env";
 import type { Difficulty, HiddenState, PrepPack } from "../types";
 
-import { callJson, LlmUnavailableError } from "./llm";
+import { callJson } from "./llm";
 import { buildOpponentPrompt } from "./prompts";
 
 // ---------------------------------------------------------------------------
@@ -27,36 +27,77 @@ const PersonaSchema = z.object({
   quirks: z.array(z.string()),
 });
 
-const HiddenSchema = z.object({
-  budget: z.number().int().min(40000).max(900000),
-  reservation: z.number().int().min(40000).max(900000),
-  target: z.number().int().min(40000).max(900000),
-  opening_anchor: z.number().int().min(40000).max(900000),
-  flex: FlexSchema,
-  persona: PersonaSchema,
-});
+const HiddenSchema = z
+  .object({
+    budget: z.number().int().min(60000).max(900000),
+    reservation: z.number().int().min(60000).max(900000),
+    target: z.number().int().min(60000).max(900000),
+    opening_anchor: z.number().int().min(60000).max(900000),
+    hiring_urgency: z.number().int().min(1).max(5).default(3),
+    flex: FlexSchema,
+    persona: PersonaSchema,
+  })
+  .refine((h) => h.reservation < h.target, { message: "reservation must be below target" })
+  .refine((h) => h.target <= h.budget, { message: "target must not exceed budget" })
+  .refine((h) => h.opening_anchor < h.reservation, {
+    message: "opening anchor must leave room to negotiate up",
+  });
 
 const PrepSchema = z.object({
   title: z.string(),
   context: z.string(),
+  role: z.string(),
+  company: z.string(),
   comp_notes: z.array(z.string()),
   coaching_objective: z.string(),
+  your_target: z.number().int().min(60000).max(900000),
+  your_reservation: z.number().int().min(60000).max(900000),
 });
 
 // ---------------------------------------------------------------------------
-// Deterministic debug fallback (AI_DEBUG=1) so UI work needs no API keys
+// Archetype variety (spec §5): shape the LLM, never hard-code numbers
 // ---------------------------------------------------------------------------
 
-export function debugScenario(): {
-  hidden: HiddenState;
-  prep: Omit<PrepPack, "role" | "company"> & { title: string };
-} {
-  return {
+const ARCHETYPES = [
+  "Senior Software Engineer at a large public tech company with structured bands",
+  "Staff Engineer at a well-funded startup where equity is a major lever",
+  "ML Engineer at a growth-stage company racing a product launch",
+  "Frontend Engineer at a smaller company with tight base but flexible culture perks",
+  "Engineering Manager at a mid-size company replacing a departing lead",
+  "candidate who already has a competing written offer from another company",
+  "candidate with deep specialist skills but no competing offer and limited leverage",
+  "candidate who values remote flexibility and start date far more than base salary",
+  "Backend Engineer at a fintech with a compliance-heavy, conservative comp committee",
+  "Full-stack Engineer at an agency-turned-product company with modest budgets",
+];
+
+function pickArchetype(difficulty: Difficulty, brief?: string): string {
+  if (brief && brief.trim().length > 3) return brief.trim();
+  // Spread archetypes across difficulties so retries feel different.
+  const idx =
+    difficulty === "easy"
+      ? Math.floor(Math.random() * 3)
+      : difficulty === "hard"
+        ? 5 + Math.floor(Math.random() * 5)
+        : 2 + Math.floor(Math.random() * 5);
+  return ARCHETYPES[Math.min(idx, ARCHETYPES.length - 1)];
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic debug fallback (AI_DEBUG=1) — varied by difficulty
+// ---------------------------------------------------------------------------
+
+const DEBUG_SCENARIOS: Record<
+  Difficulty,
+  { hidden: Omit<HiddenState, "hiring_urgency"> & { hiring_urgency: number }; prep: PrepPack }
+> = {
+  easy: {
     hidden: {
       budget: 172000,
       reservation: 138000,
       target: 148000,
       opening_anchor: 132000,
+      hiring_urgency: 2,
       flex: {
         sign_on_max: 15000,
         equity_max: 12000,
@@ -67,25 +108,117 @@ export function debugScenario(): {
       persona: {
         name: "Dana Reyes",
         title: "Director of Engineering",
-        style: "brisk",
-        aggression: 3,
-        priorities: ["staying within band", "fast close", "team culture fit"],
-        quirks: ["responds well to market data", "gets impatient with rambling"],
+        style: "warm",
+        aggression: 2,
+        priorities: ["closing quickly", "candidate happiness", "staying within band"],
+        quirks: ["responds well to market data", "dislikes aggressive tactics"],
       },
     },
     prep: {
       title: "Senior Engineer offer call at Nimbus Data",
       context:
-        "You just received good news: Nimbus Data wants to extend an offer for a Senior Engineer role. Dana Reyes, Director of Engineering, is calling to walk through compensation.",
+        "Nimbus Data wants you for a Senior Engineer role. Dana Reyes is calling with the offer and hoping to wrap this up quickly.",
+      role: "Senior Engineer",
+      company: "Nimbus Data",
       comp_notes: [
         "Base salary is the main component",
-        "Sign-on bonus and annual equity refresh are negotiable levers",
+        "Sign-on bonus and annual equity refresh exist",
         "Remote days and start date may be flexible",
       ],
       coaching_objective:
         "Practice anchoring above your target and trading concessions instead of donating them.",
+      your_target: 152000,
+      your_reservation: 138000,
     },
-  };
+  },
+  medium: {
+    hidden: {
+      budget: 168000,
+      reservation: 140000,
+      target: 150000,
+      opening_anchor: 131000,
+      hiring_urgency: 3,
+      flex: {
+        sign_on_max: 12000,
+        equity_max: 16000,
+        remote_days: 2,
+        start_date_weeks: 4,
+        extra_pto_days: 3,
+      },
+      persona: {
+        name: "Marcus Webb",
+        title: "Head of Engineering",
+        style: "brisk",
+        aggression: 3,
+        priorities: ["band integrity", "fast close", "team culture fit"],
+        quirks: ["answers questions with questions", "moves only on evidence"],
+      },
+    },
+    prep: {
+      title: "Backend Engineer offer call at Ledgerline",
+      context:
+        "Ledgerline, a Series B fintech, wants you for a Backend Engineer role. Marcus Webb is calling with the numbers.",
+      role: "Backend Engineer",
+      company: "Ledgerline",
+      comp_notes: [
+        "Base plus annual equity grant",
+        "Sign-on possible but capped",
+        "Hybrid: some remote days negotiable",
+      ],
+      coaching_objective:
+        "Get the recruiter to reveal priorities, then trade on what they value.",
+      your_target: 155000,
+      your_reservation: 140000,
+    },
+  },
+  hard: {
+    hidden: {
+      budget: 178000,
+      reservation: 146000,
+      target: 154000,
+      opening_anchor: 133000,
+      hiring_urgency: 4,
+      flex: {
+        sign_on_max: 8000,
+        equity_max: 10000,
+        remote_days: 1,
+        start_date_weeks: 2,
+        extra_pto_days: 0,
+      },
+      persona: {
+        name: "Priya Nair",
+        title: "VP of Engineering",
+        style: "combative",
+        aggression: 4,
+        priorities: ["cost discipline", "precedent protection", "proving conviction"],
+        quirks: ["challenges every claim", "punishes vagueness", "respects composure"],
+      },
+    },
+    prep: {
+      title: "Analytics Lead offer call at Corvid Partners",
+      context:
+        "Corvid Partners, a prestigious consulting firm, wants you to lead their analytics practice. Priya Nair is calling and she is famously tough.",
+      role: "Analytics Lead",
+      company: "Corvid Partners",
+      comp_notes: [
+        "Base-heavy structure, modest equity",
+        "Small sign-on flexibility",
+        "Limited remote flexibility",
+      ],
+      coaching_objective:
+        "Hold your anchor under pressure without revealing your floor. Make her move first.",
+      your_target: 160000,
+      your_reservation: 147500,
+    },
+  },
+};
+
+export function debugScenario(difficulty: Difficulty = "medium"): {
+  hidden: HiddenState;
+  prep: PrepPack;
+} {
+  const d = DEBUG_SCENARIOS[difficulty] ?? DEBUG_SCENARIOS.medium;
+  return { hidden: d.hidden, prep: d.prep };
 }
 
 // ---------------------------------------------------------------------------
@@ -103,34 +236,70 @@ export async function generateScenario(input: {
   brief?: string;
 }): Promise<GeneratedScenario> {
   if (env().AI_DEBUG) {
-    const d = debugScenario();
-    return {
-      hidden: d.hidden,
-      prepPack: {
-        role: "Senior Engineer",
-        company: "Nimbus Data",
-        ...d.prep,
-      },
-    };
+    const dbg = debugScenario(input.difficulty);
+    return { hidden: dbg.hidden, prepPack: dbg.prep };
   }
 
+  const archetype = pickArchetype(input.difficulty, input.brief);
   const { content: raw, provider } = await callJson({
     system:
-      "You design realistic salary negotiation simulations. You invent plausible companies, roles, and compensation bands (USD, annual). Hidden numbers must be internally consistent: reservation < target <= budget, opening_anchor between reservation and target. Prep pack must NOT leak hidden numbers or the persona's private constraints.",
-    user: `Difficulty: ${input.difficulty}. ${
-      input.brief ? `Extra direction: ${input.brief}.` : ""
-    } Invent a complete simulation. Respond with JSON only.`,
+      "You design realistic US salary negotiation simulations (all amounts in USD per year). You invent plausible companies, roles, and compensation bands. Hidden numbers must be internally consistent: opening_anchor < reservation < target <= budget; your_target and your_reservation (the CANDIDATE's prep guidance) must overlap the company band plausibly — the candidate's target should be near or slightly above the company's target. Flex values must be consistent with the archetype (a startup gives equity, a consulting firm barely any). Prep pack must NOT leak the company's private numbers, but your_target/your_reservation are the candidate's own guidance and are expected.",
+    user: `Difficulty: ${input.difficulty}. Archetype direction: ${archetype}. Invent a complete simulation with a specific invented company name (not Nimbus Data or any generic placeholder), named recruiter persona, and internally consistent economics. Respond with JSON only.`,
     schemaName: "scenario",
     schema: {
       type: "object",
       additionalProperties: false,
       required: ["hidden", "prep"],
       properties: {
-        hidden: HiddenZodToJson(),
+        hidden: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "budget",
+            "reservation",
+            "target",
+            "opening_anchor",
+            "hiring_urgency",
+            "flex",
+            "persona",
+          ],
+          properties: {
+            budget: { type: "integer", description: "Absolute ceiling for base salary in USD" },
+            reservation: { type: "integer", description: "Company walk-away floor in USD" },
+            target: { type: "integer", description: "Where the recruiter wants to land in USD" },
+            opening_anchor: { type: "integer", description: "The opening offer in USD" },
+            hiring_urgency: { type: "integer", minimum: 1, maximum: 5, description: "1 = desperate, 5 = leisurely" },
+            flex: {
+              type: "object",
+              additionalProperties: false,
+              required: ["sign_on_max", "equity_max", "remote_days", "start_date_weeks", "extra_pto_days"],
+              properties: {
+                sign_on_max: { type: "integer" },
+                equity_max: { type: "number" },
+                remote_days: { type: "integer" },
+                start_date_weeks: { type: "integer" },
+                extra_pto_days: { type: "integer" },
+              },
+            },
+            persona: {
+              type: "object",
+              additionalProperties: false,
+              required: ["name", "title", "style", "aggression", "priorities", "quirks"],
+              properties: {
+                name: { type: "string" },
+                title: { type: "string" },
+                style: { type: "string", description: "warm, brisk, poker-face, combative, or avuncular" },
+                aggression: { type: "integer", minimum: 1, maximum: 5 },
+                priorities: { type: "array", items: { type: "string" } },
+                quirks: { type: "array", items: { type: "string" } },
+              },
+            },
+          },
+        },
         prep: {
           type: "object",
           additionalProperties: false,
-          required: ["title", "context", "comp_notes", "coaching_objective", "role", "company"],
+          required: ["title", "context", "comp_notes", "coaching_objective", "role", "company", "your_target", "your_reservation"],
           properties: {
             title: { type: "string" },
             context: { type: "string", description: "2-3 sentences of scene-setting for the candidate" },
@@ -138,6 +307,8 @@ export async function generateScenario(input: {
             coaching_objective: { type: "string" },
             role: { type: "string" },
             company: { type: "string" },
+            your_target: { type: "integer", description: "Candidate's prep target in USD" },
+            your_reservation: { type: "integer", description: "Candidate's prep walk-away floor in USD" },
           },
         },
       },
@@ -147,106 +318,68 @@ export async function generateScenario(input: {
 
   const parsed = JSON.parse(raw) as {
     hidden: HiddenState;
-    prep: {
-      title: string;
-      context: string;
-      comp_notes: string[];
-      coaching_objective: string;
-      role: string;
-      company: string;
-    };
+    prep: PrepPack;
   };
 
   const hidden = HiddenSchema.parse(parsed.hidden);
-  const prepPack: PrepPack = {
-    role: parsed.prep.role,
-    company: parsed.prep.company,
-    title: parsed.prep.title,
-    context: parsed.prep.context,
-    comp_notes: parsed.prep.comp_notes,
-    coaching_objective: parsed.prep.coaching_objective,
-  };
+  const prepPack: PrepPack = PrepSchema.parse(parsed.prep);
 
   return { hidden, prepPack };
 }
 
 // ---------------------------------------------------------------------------
-// Retry variants: re-roll hidden numbers with slight variance + harder persona
+// Retry variants: SAME core economics (spec §12) — only persona pressure changes
 // ---------------------------------------------------------------------------
 
 export function deriveVariant(
   hidden: HiddenState,
   opts: { harder?: boolean; reRoll?: boolean },
 ): HiddenState {
-  const jitter = (n: number, pct: number) => Math.round(n * (1 + (Math.random() * 2 - 1) * pct));
-
-  const reRolled: HiddenState = opts.reRoll
-    ? {
-        ...hidden,
-        budget: jitter(hidden.budget, 0.04),
-        reservation: jitter(hidden.reservation, 0.05),
-        target: jitter(hidden.target, 0.05),
-        opening_anchor: jitter(hidden.opening_anchor, 0.05),
-      }
-    : hidden;
-
-  if (!opts.harder) return reRolled;
-
-  return {
-    ...reRolled,
-    reservation: Math.min(
-      reRolled.budget - 2000,
-      Math.round(reRolled.reservation * 1.05),
-    ),
-    persona: {
-      ...reRolled.persona,
-      aggression: Math.min(5, reRolled.persona.aggression + 1) as 1 | 2 | 3 | 4 | 5,
-      style: reRolled.persona.style === "combative" ? "stone-walled and terse" : reRolled.persona.style,
-    },
-  };
+  if (opts.harder) {
+    // Harder = more resistant recruiter. Economics (budget/reservation/target/
+    // anchor) are untouched so the underlying problem is identical.
+    return {
+      ...hidden,
+      persona: {
+        ...hidden.persona,
+        aggression: Math.min(5, hidden.persona.aggression + 1) as 1 | 2 | 3 | 4 | 5,
+        style:
+          hidden.persona.aggression >= 4
+            ? "stone-walled and terse"
+            : hidden.persona.style,
+        quirks: [
+          ...new Set([
+            ...hidden.persona.quirks,
+            "concedes only with strong evidence",
+            "counters with questions before numbers",
+          ]),
+        ].slice(0, 5),
+      },
+      hiring_urgency: Math.min(5, hidden.hiring_urgency + 1),
+    };
+  }
+  // reroll: same economics, persona color varies for a fresh conversational run.
+  if (opts.reRoll) {
+    const styles = ["warm", "brisk", "poker-face", "avuncular", "combative"];
+    const newStyle = styles[Math.floor(Math.random() * styles.length)];
+    const names = ["Jordan Hale", "Sam Okafor", "Riley Chen", "Morgan Diaz", "Alex Ferreira"];
+    const newName = names[Math.floor(Math.random() * names.length)];
+    return {
+      ...hidden,
+      persona: {
+        ...hidden.persona,
+        name: newName,
+        style: newStyle,
+        quirks: [
+          ...new Set([...hidden.persona.quirks, "opens with a different framing"]),
+        ].slice(0, 5),
+      },
+    };
+  }
+  return hidden;
 }
 
 /** Build the stored-agent system prompt for a scenario/variant. */
 export function agentPromptFor(hidden: HiddenState): string {
   return buildOpponentPrompt(hidden);
-}
-
-// Keep a local JSON-schema mirror of HiddenSchema for strict responses.
-function HiddenZodToJson(): Record<string, unknown> {
-  return {
-    type: "object",
-    additionalProperties: false,
-    required: ["budget", "reservation", "target", "opening_anchor", "flex", "persona"],
-    properties: {
-      budget: { type: "integer", description: "Absolute ceiling for base salary in USD" },
-      reservation: { type: "integer", description: "Walk-away floor in USD" },
-      target: { type: "integer", description: "Where the recruiter wants to land in USD" },
-      opening_anchor: { type: "integer", description: "The opening offer in USD" },
-      flex: {
-        type: "object",
-        additionalProperties: false,
-        required: ["sign_on_max", "equity_max", "remote_days", "start_date_weeks", "extra_pto_days"],
-        properties: {
-          sign_on_max: { type: "integer" },
-          equity_max: { type: "number" },
-          remote_days: { type: "integer" },
-          start_date_weeks: { type: "integer" },
-          extra_pto_days: { type: "integer" },
-        },
-      },
-      persona: {
-        type: "object",
-        additionalProperties: false,
-        required: ["name", "title", "style", "aggression", "priorities", "quirks"],
-        properties: {
-          name: { type: "string" },
-          title: { type: "string" },
-          style: { type: "string", description: "warm, brisk, poker-face, combative, or avuncular" },
-          aggression: { type: "integer", minimum: 1, maximum: 5 },
-          priorities: { type: "array", items: { type: "string" } },
-          quirks: { type: "array", items: { type: "string" } },
-        },
-      },
-    },
-  };
 }
