@@ -27,10 +27,11 @@ export interface CreateAgentBody {
  * server-side; the browser only ever receives the agent_id.
  */
 export async function createAgent(body: CreateAgentBody): Promise<string> {
+  const key = requireAssemblyAIKey();
   const res = await fetch(`${BASE}/v1/agents`, {
     method: "POST",
     headers: {
-      Authorization: requireAssemblyAIKey(),
+      Authorization: key,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -45,10 +46,11 @@ export async function createAgent(body: CreateAgentBody): Promise<string> {
 }
 
 export async function updateAgent(id: string, body: Partial<CreateAgentBody>): Promise<void> {
+  const key = requireAssemblyAIKey();
   const res = await fetch(`${BASE}/v1/agents/${id}`, {
     method: "PUT",
     headers: {
-      Authorization: requireAssemblyAIKey(),
+      Authorization: key,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -63,9 +65,10 @@ export async function updateAgent(id: string, body: Partial<CreateAgentBody>): P
 export async function deleteAgent(id: string | null | undefined): Promise<void> {
   if (!id) return;
   try {
+    const key = requireAssemblyAIKey();
     await fetch(`${BASE}/v1/agents/${id}`, {
       method: "DELETE",
-      headers: { Authorization: requireAssemblyAIKey() },
+      headers: { Authorization: key },
     });
   } catch {
     // ignore cleanup failures

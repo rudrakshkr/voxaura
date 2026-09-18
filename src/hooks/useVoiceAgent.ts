@@ -298,8 +298,12 @@ export function useVoiceAgent(args: {
       ws.onopen = () => {
         if (resumeSessionId) {
           send({ type: "session.resume", session_id: resumeSessionId });
+          // Re-attach the agent config after resume (some servers drop it).
+          if (a.agentMode === "stored" && a.agentId) {
+            send({ type: "session.update", session: { agent_id: a.agentId, output: { voice: "anna" } } });
+          }
         } else if (a.agentMode === "stored" && a.agentId) {
-          send({ type: "session.update", session: { agent_id: a.agentId } });
+          send({ type: "session.update", session: { agent_id: a.agentId, output: { voice: "anna" } } });
         } else if (a.agentMode === "inline" && a.inlineConfig) {
           send({
             type: "session.update",
@@ -330,13 +334,18 @@ export function useVoiceAgent(args: {
           patch({ status: "ended" });
           return;
         }
-        // Abnormal close: one resume attempt within the 30s server grace window.
+
+        // AssemblyAI may close a session during greeting setup or policy checks.
+        // Give a live call a brief, bounded chance to re-establish rather than
+        // surfacing a raw close code to the user immediately.
         const canResume =
           !resumedOnceRef.current &&
           sessionIdRef.current &&
           startedAtRef.current &&
-          Date.now() - startedAtRef.current < 15 * 60_000 &&
-          ev.code !== 1008;
+          Date.now() - startedAtRef.current < 15 * 60_000
+          // 1008 = policy/payload close; retry once only if we never got ready,
+          // since an established session that then closes 1008 is usually fatal.
+          && (ev.code !== 1008 || statusRef.current !== "ready");
         if (canResume) {
           resumedOnceRef.current = true;
           patch({ status: "reconnecting" });
@@ -345,7 +354,6 @@ export function useVoiceAgent(args: {
               patch({ status: "error", error: `Reconnect failed: ${(err as Error).message}` });
             });
           }, 1200);
-          // Give up if the grace window lapses.
           window.setTimeout(() => {
             if (
               wsRef.current?.readyState !== WebSocket.OPEN &&
@@ -355,15 +363,26 @@ export function useVoiceAgent(args: {
             }
           }, RESUME_GRACE_MS);
         } else {
+          // If we never reached ready, the problem is almost certainly the
+          // session setup (agent, greeting, or config) rather than the transport.
+          const setupFailed =
+            statusRef.current !== "ready" && statusRef.current !== "reconnecting";
           patch({
             status: "error",
-            error: `Connection closed (${ev.code})${ev.reason ? `: ${ev.reason}` : ""}`,
+            error:
+              setupFailed && ev.code === 1008
+                ? "The opponent agent couldn't start. It may have been deleted or expired — pick a different scenario or retry."
+                : `Connection closed (${ev.code})${ev.reason ? `: ${ev.reason}` : ""}`,
           });
         }
       };
 
       ws.onerror = () => {
         // onclose follows with details; surface nothing here.
+        // Mark the attempt as a failed setup so the user sees a clear path.
+        if (statusRef.current === "connecting" || statusRef.current === "reconnecting") {
+          // Let onclose decide the final message.
+        }
       };
 
       function handleEvent(event: VoiceAgentEvent) {

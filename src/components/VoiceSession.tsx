@@ -9,22 +9,21 @@ import { TranscriptView } from "./TranscriptView";
 import { VoiceStateBar } from "./VoiceStateBar";
 import { money, Spinner, StatusPill } from "./ui";
 import { useVoiceAgent } from "@/hooks/useVoiceAgent";
-import type { ScenarioPublic } from "@/lib/types";
-
-interface Props {
+import type { ScenarioPublic } from "@/lib/types";interface Props {
   attemptId: string;
   agentId: string | null;
   agentMode: "stored" | "inline";
+  inlineConfig?: { systemPrompt: string; greeting: string } | null;
   scenario: ScenarioPublic;
   retryMode: string | null;
 }
-
 export function VoiceSession(props: Props) {
   const router = useRouter();
   const { state, connect, end } = useVoiceAgent({
     attemptId: props.attemptId,
     agentId: props.agentId,
     agentMode: props.agentMode,
+    inlineConfig: props.inlineConfig ?? null,
   });
   const [completing, setCompleting] = useState(false);
   const [completeError, setCompleteError] = useState<string | null>(null);

@@ -12,6 +12,7 @@ interface AttemptResponse {
   agent_id: string | null;
   agent_mode: "stored" | "inline";
   greeting: string;
+  system_prompt?: string;
 }
 
 export default function ScenarioPrepPage() {
@@ -46,10 +47,15 @@ export default function ScenarioPrepPage() {
       }
       const data = (await res.json()) as AttemptResponse;
       // agent_id is not secret (the prompt is); passing it here lets the
-      // session bind to this attempt's stored opponent directly.
-      router.push(
-        `/scenario/${id}/session?attempt=${data.attempt_id}&mode=${data.agent_mode}&agent=${data.agent_id ?? ""}`,
-      );
+      // session bind to this attempt's stored opponent directly. When the
+      // mode is inline, the system_prompt is also passed for the session page
+      // to forward to the client-side voice config.
+      const params = new URLSearchParams();
+      params.set("attempt", data.attempt_id);
+      params.set("mode", data.agent_mode);
+      if (data.agent_id) params.set("agent", data.agent_id);
+      if (data.system_prompt) params.set("prompt", data.system_prompt);
+      router.push(`/scenario/${id}/session?${params.toString()}`);
     } catch (err) {
       setError((err as Error).message);
       setStarting(false);

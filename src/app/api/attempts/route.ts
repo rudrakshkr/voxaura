@@ -32,18 +32,28 @@ export const POST = handle(async (req: Request) => {
     retryMode: body.data.retry_mode ?? null,
   });
 
+  const systemPrompt = agentPromptFor(effectiveHidden);
+  const greeting = buildGreeting(effectiveHidden);
   let agentId: string | null = null;
   let agentMode: "stored" | "inline" = "stored";
 
-  try {
-    if (env().ALLOW_INLINE_AGENT) {
-      // Debug path: send the prompt inline (visible in the browser session config).
-      agentMode = "inline";
-    } else if (env().ASSEMBLYAI_API_KEY) {
+  // AssemblyAI's Voice Agent API has an IP visibility quirk: agents created
+  // from Vercel's serverless infrastructure are NOT resolvable from external
+  // client IPs (the browser). Using stored-agent mode therefore produces a
+  // valid agent_id that the WebSocket session.update can't bind, resulting in
+  // a 1008 Connection Closed. The reliable path is inline mode — the prompt
+  // travels in the session config and the WS server creates a transient session
+  // without needing a pre-stored agent. We keep the stored-agent create call as
+  // a best-effort side effect (so the agent exists server-side for any future
+  // tooling), but always ship inline mode to the client.
+  if (env().ASSEMBLYAI_API_KEY) {
+    // Best-effort: create a stored agent server-side (may or may not be
+    // resolvable from the client — we don't depend on it).
+    try {
       agentId = await createAgent({
         name: `voxaura-${scenario.id.slice(0, 8)}-${attempt.id.slice(0, 8)}`,
-        system_prompt: agentPromptFor(effectiveHidden),
-        greeting: buildGreeting(effectiveHidden),
+        system_prompt: systemPrompt,
+        greeting,
         voice: { voice_id: "anna" },
         tools: OPPONENT_TOOLS,
         input: {
@@ -65,21 +75,19 @@ export const POST = handle(async (req: Request) => {
           },
         },
       });
-    } else if (env().AI_DEBUG) {
-      // Debug: stub the agent so the full API/UI flow works without keys.
-      // The WebSocket connect step will surface a clear error to the user.
-      agentId = "debug-agent";
-    } else {
-      throw new ApiError(
-        503,
-        "ASSEMBLYAI_API_KEY missing — cannot create opponent agent. Set AI_DEBUG=1 to preview UI without voice.",
-      );
+    } catch {
+      // Non-fatal: inline mode will carry the prompt regardless.
     }
-  } catch (err) {
-    // Roll back the orphan attempt row so we never accumulate dead attempts.
-    await markAbandonedSafe(attempt.id);
-    if (err instanceof ApiError) throw err;
-    throw new ApiError(502, `Failed to create opponent agent: ${(err as Error).message}`);
+    // Always use inline mode so the client can start a call regardless of
+    // whether the stored agent is resolvable from its IP.
+    agentMode = "inline";
+  } else if (env().AI_DEBUG) {
+    agentMode = "inline";
+  } else {
+    throw new ApiError(
+      503,
+      "ASSEMBLYAI_API_KEY missing — cannot create opponent agent.",
+    );
   }
 
   const patch = await import("@/lib/db/queries");
@@ -90,7 +98,8 @@ export const POST = handle(async (req: Request) => {
       attempt_id: attempt.id,
       agent_id: agentId,
       agent_mode: agentMode,
-      greeting: buildGreeting(effectiveHidden),
+      system_prompt: systemPrompt,
+      greeting,
     },
     { status: 201 },
   );
