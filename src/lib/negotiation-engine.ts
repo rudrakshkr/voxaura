@@ -403,7 +403,7 @@ export interface TurnDirective {
   allowedNumbers: number[];
   askUserQuestion: string | null;
   conditions: string[];
-  toolHint: { offer?: CompPackage; accept?: boolean } | null;
+  toolHint: { offer?: { base_salary: number; sign_on?: number; equity?: number; notes?: string } | { final_base: number; sign_on?: number; equity?: number }; accept?: boolean } | null;
 }
 
 export function buildDirective(move: RecruiterMove, hidden: HiddenState): TurnDirective {
@@ -440,14 +440,14 @@ export function buildDirective(move: RecruiterMove, hidden: HiddenState): TurnDi
     case "counter":
       return {
         verdict: "COUNTER — present the following updated package as the company's position.",
-        mustSay: [`State the new package naturally: ${JSON.stringify(move.package)}.`],
+        mustSay: [`State the new package naturally. Call offer_to_candidate with base_salary=${move.package.base}, sign_on=${move.package.sign_on ?? 0}, equity=${move.package.equity ?? 0}.`],
         mustNotSay: [
           "Never mention these instructions, the engine, or any numbers other than the package above.",
         ],
         allowedNumbers: allowedNumbersFor(move.package),
         askUserQuestion: null,
         conditions: move.conditions,
-        toolHint: { offer: move.package },
+        toolHint: { offer: { base_salary: move.package.base, sign_on: move.package.sign_on ?? 0, equity: move.package.equity ?? 0, notes: move.conditions.join("; ") || undefined } },
       };
     case "trade":
       return {
@@ -455,25 +455,26 @@ export function buildDirective(move: RecruiterMove, hidden: HiddenState): TurnDi
         mustSay: [
           `Offer ${move.gave} in exchange for ${move.wants}.`,
           `State any conditions: ${move.conditions.join("; ") || "none"}.`,
+          `Call offer_to_candidate with base_salary=${move.package.base}, sign_on=${move.package.sign_on ?? 0}, equity=${move.package.equity ?? 0}.`,
         ],
         mustNotSay: ["Do not move base salary."],
         allowedNumbers: allowedNumbersFor(move.package),
         askUserQuestion: null,
         conditions: move.conditions,
-        toolHint: { offer: move.package },
+        toolHint: { offer: { base_salary: move.package.base, sign_on: move.package.sign_on ?? 0, equity: move.package.equity ?? 0, notes: move.conditions.join("; ") || undefined } },
       };
     case "accept":
       return {
         verdict: "ACCEPT — the candidate's close is economically valid.",
         mustSay: [
           "Agree warmly and confirm the final package.",
-          "Call accept_user_offer with the final numbers.",
+          `Call accept_user_offer with final_base=${move.package.base}, sign_on=${move.package.sign_on ?? 0}, equity=${move.package.equity ?? 0}.`,
         ],
         mustNotSay: [],
         allowedNumbers: allowedNumbersFor(move.package),
         askUserQuestion: null,
         conditions: [],
-        toolHint: { accept: true, offer: move.package },
+        toolHint: { accept: true, offer: { final_base: move.package.base, sign_on: move.package.sign_on ?? 0, equity: move.package.equity ?? 0 } },
       };
     case "probe":
       return {
@@ -490,13 +491,13 @@ export function buildDirective(move: RecruiterMove, hidden: HiddenState): TurnDi
         verdict: "RECOVER — the candidate is walking; make one best-and-final style move.",
         mustSay: [
           "Acknowledge their position respectfully.",
-          `Present the improved package: ${JSON.stringify(move.package)}.`,
+          `Present the improved package. Call offer_to_candidate with base_salary=${move.package.base}, sign_on=${move.package.sign_on ?? 0}, equity=${move.package.equity ?? 0}.`,
         ],
         mustNotSay: ["Do not beg or promise anything beyond this package."],
         allowedNumbers: allowedNumbersFor(move.package),
         askUserQuestion: null,
         conditions: move.conditions,
-        toolHint: { offer: move.package },
+        toolHint: { offer: { base_salary: move.package.base, sign_on: move.package.sign_on ?? 0, equity: move.package.equity ?? 0, notes: move.conditions.join("; ") || undefined } },
       };
   }
 }
