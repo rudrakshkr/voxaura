@@ -88,7 +88,26 @@ export function VoiceSession(props: Props) {
 
       {state.error && (
         <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
-          {state.error}
+          <p>{state.error}</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                void connect();
+              }}
+            >
+              Try again
+            </button>
+            <Link href={`/scenario/${props.scenario.id}`} className="btn btn-ghost">
+              Back to prep
+            </Link>
+          </div>
+          {state.transcript.length > 0 && (
+            <p className="mt-2 text-xs text-white/50">
+              Your transcript so far is saved — you can still score this attempt instead of
+              retrying.
+            </p>
+          )}
         </div>
       )}
 
@@ -132,8 +151,13 @@ export function VoiceSession(props: Props) {
             )}
 
             {(state.status === "connecting" || state.status === "reconnecting") && (
-              <div className="flex items-center gap-2 text-sm text-white/60">
-                <Spinner /> Setting up the call…
+              <div className="space-y-2 text-sm text-white/60">
+                <div className="flex items-center gap-2">
+                  <Spinner /> Setting up the call…
+                </div>
+                <p className="text-xs text-white/40">
+                  Your browser will ask for microphone access — click Allow.
+                </p>
               </div>
             )}
 

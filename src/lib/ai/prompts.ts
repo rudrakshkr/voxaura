@@ -59,9 +59,9 @@ Directives override anything below. If no directive is pending, follow the gener
 `.trim();
 }
 
-/** Greeting spoken at call start. */
+/** Greeting spoken at call start — kept short for fast time-to-first-audio. */
 export function buildGreeting(hidden: HiddenState): string {
-  return `Hi, this is ${hidden.persona.name}. Thanks for making the time today - I've got some good news about the role, and I'd love to walk through the details with you. Do you have a few minutes?`;
+  return `Hi, this is ${hidden.persona.name} calling about your offer. I have the details in front of me — ready to walk through them?`;
 }
 
 /**

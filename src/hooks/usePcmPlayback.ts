@@ -13,6 +13,9 @@ export function usePcmPlayback() {
   const ctxRef = useRef<AudioContext | null>(null);
   const cursorRef = useRef(0);
   const sourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  // Set once ANY audio chunk arrives — the greeting watchdog uses this to
+  // detect a connected-but-silent opponent.
+  const receivedAudioRef = useRef(false);
 
   const ensureCtx = useCallback((): AudioContext => {
     if (!ctxRef.current || ctxRef.current.state === "closed") {
@@ -23,6 +26,7 @@ export function usePcmPlayback() {
 
   const play = useCallback(
     (b64: string) => {
+      receivedAudioRef.current = true;
       const ctx = ensureCtx();
       const int16 = decodeBase64PCM(b64);
       const float = new Float32Array(int16.length);
@@ -68,5 +72,8 @@ export function usePcmPlayback() {
     ctxRef.current = null;
   }, [flush]);
 
-  return { ensureCtx, play, flush, close };
+  /** True once any recruiter audio has arrived since hook creation. */
+  const hasReceivedAudio = useCallback(() => receivedAudioRef.current, []);
+
+  return { ensureCtx, play, flush, close, hasReceivedAudio };
 }

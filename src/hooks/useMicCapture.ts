@@ -18,6 +18,8 @@ export function useMicCapture() {
   const workletRef = useRef<AudioWorkletNode | null>(null);
 
   const start = useCallback(async ({ onChunk }: StartOpts): Promise<void> => {
+    // Idempotent: retrying a failed connect must not double-open the mic.
+    if (streamRef.current) return;
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
