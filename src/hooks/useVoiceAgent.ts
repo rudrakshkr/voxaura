@@ -19,6 +19,7 @@ import type { TurnDirective } from "@/lib/negotiation-engine";
  */
 const OPPONENT_TOOLS = [
   {
+    type: "function",
     name: "offer_to_candidate",
     description:
       "State a formal offer to the candidate. Call this whenever you present or revise your compensation numbers aloud, including your opening numbers.",
@@ -46,6 +47,7 @@ const OPPONENT_TOOLS = [
     },
   },
   {
+    type: "function",
     name: "accept_user_offer",
     description:
       "Accept the candidate's proposed package. Call this the moment you decide to agree to the candidate's numbers.",
@@ -63,6 +65,7 @@ const OPPONENT_TOOLS = [
     },
   },
   {
+    type: "function",
     name: "log_user_move",
     description:
       "Log a negotiation move the candidate just made. Call after the candidate states a number, makes a concession, applies pressure, or raises an objection.",
