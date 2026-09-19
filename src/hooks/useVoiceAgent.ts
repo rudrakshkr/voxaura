@@ -391,6 +391,13 @@ export function useVoiceAgent(args: {
               greeting: a.inlineConfig.greeting,
               output: { voice: "anna" },
               tools: OPPONENT_TOOLS,
+              input: {
+                turn_detection: {
+                  min_silence: 700,
+                  max_silence: 1600,
+                  interrupt_response: true,
+                },
+              },
             },
           });
         } else {

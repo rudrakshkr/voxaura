@@ -288,6 +288,31 @@ Score the CANDIDATE now. Every dimension feedback MUST cite or closely paraphras
     }
   }
 
+  // When the model omits strengths/improvements/communication (common with
+  // smaller models or json_object fallback), build them from the rubric so the
+  // report page never renders empty sections.
+  if (out.strengths.length === 0) {
+    out.strengths = out.rubric
+      .filter((r) => r.score >= 6)
+      .map((r) => `Strong ${r.dimension}: ${r.feedback}`);
+    if (out.strengths.length === 0) out.strengths.push("Complete negotiation attempt — review the dimension scores for specifics.");
+  }
+  if (out.improvements.length === 0) {
+    out.improvements = out.rubric
+      .filter((r) => r.score < 6)
+      .map((r) => `Work on ${r.dimension}: ${r.feedback}`);
+    if (out.improvements.length === 0) out.improvements.push("Continued practice — review the dimension scores for areas to develop.");
+  }
+  if (!out.communication || (out.communication.clarity === "" && out.communication.confidence === "" && out.communication.composure === "" && out.communication.rapport === "")) {
+    const lowDims = out.rubric.filter((r) => r.score < 6).map((r) => r.dimension.toLowerCase());
+    out.communication = {
+      clarity: lowDims.some((d) => d.includes("information")) ? "You shared numbers before fully understanding the recruiter's flexibility — state your ask first, then ask what they can do." : "Your statements were understandable; keep answers short and direct on a live call.",
+      confidence: out.rubric.some((r) => r.score >= 6) ? "You made concrete asks and held your position — carry that same specificity into the next call." : "Speak in full sentences and avoid hedging phrases like 'maybe' or 'I was hoping.' State numbers directly.",
+      composure: "Stay calm when the recruiter pushes back — a pause before responding reads as deliberation, not hesitation.",
+      rapport: "Acknowledge the recruiter's constraints briefly before making your next ask; it keeps the exchange collaborative.",
+    };
+  }
+
   // Merge live events with extracted ones (live first, extracted appended).
   const merged: NegotiationEvent[] = [...input.liveEvents];
   for (const e of out.events) {
@@ -344,7 +369,7 @@ Score the CANDIDATE now. Every dimension feedback MUST cite or closely paraphras
     rubric,
     strengths: out.strengths,
     improvements: out.improvements,
-    communication: out.communication ?? null,
+    communication: out.communication ?? { clarity: "", confidence: "", composure: "", rapport: "" },
     summary: out.summary,
     outcome: input.outcome ?? coerceOutcome(out.outcome),
     final_offer: finalOffer,
