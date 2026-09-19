@@ -98,6 +98,7 @@ export const POST = handle(async (req: Request) => {
       attempt_id: attempt.id,
       agent_id: agentId,
       agent_mode: agentMode,
+      retry_mode: attempt.retry_mode,
       system_prompt: systemPrompt,
       greeting,
     },
