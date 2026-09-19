@@ -247,16 +247,32 @@ export async function saveReport(
     transcript: unknown;
   },
 ): Promise<void> {
-  await db.insert(reports).values({
-    attempt_id: attemptId,
-    overall_score: report.overall_score,
-    rubric: report.rubric as never,
-    strengths: report.strengths,
-    improvements: report.improvements,
-    summary: report.summary,
-    communication: (report.communication ?? null) as never,
-    transcript: report.transcript as never,
-  });
+  // Upsert: re-completing an attempt (retry scoring, engine re-finalize)
+  // must replace the row, not trip the unique constraint.
+  await db
+    .insert(reports)
+    .values({
+      attempt_id: attemptId,
+      overall_score: report.overall_score,
+      rubric: report.rubric as never,
+      strengths: report.strengths,
+      improvements: report.improvements,
+      summary: report.summary,
+      communication: (report.communication ?? null) as never,
+      transcript: report.transcript as never,
+    })
+    .onConflictDoUpdate({
+      target: reports.attempt_id,
+      set: {
+        overall_score: report.overall_score,
+        rubric: report.rubric as never,
+        strengths: report.strengths,
+        improvements: report.improvements,
+        summary: report.summary,
+        communication: (report.communication ?? null) as never,
+        transcript: report.transcript as never,
+      },
+    });
 }
 
 export async function listHistory(): Promise<

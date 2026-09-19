@@ -117,6 +117,98 @@ export function debugReport(
 }
 
 // ---------------------------------------------------------------------------
+// Degraded report (all LLM providers failed) — honest, heuristic, never empty
+// ---------------------------------------------------------------------------
+
+/**
+ * When every provider is down (out of credits, outage), the judge/user still
+ * gets their transcript, timeline, and a real outcome — with a clearly-labeled
+ * heuristic score instead of an error page. The score is derived only from
+ * server-verified facts (final package vs opening anchor, event counts).
+ */
+export function degradedReport(
+  transcript: TranscriptTurn[],
+  liveEvents: NegotiationEvent[],
+  finalOffer: CompPackage | null,
+  outcome: Outcome | null,
+  openingOfferBase: number,
+): ReportData {
+  const heuristic: string[] = [];
+
+  // Outcome-based evaluation from server-verified facts only.
+  let base = 50;
+  if (finalOffer) {
+    const gain = (finalOffer.base - openingOfferBase) / openingOfferBase;
+    if (gain >= 0.08) {
+      base = 78;
+      heuristic.push(`You moved base from $${openingOfferBase.toLocaleString()} to $${finalOffer.base.toLocaleString()} (+${Math.round(gain * 100)}%) — a strong result.`);
+    } else if (gain >= 0.03) {
+      base = 64;
+      heuristic.push(`You moved base from $${openingOfferBase.toLocaleString()} to $${finalOffer.base.toLocaleString()} (+${Math.round(gain * 100)}%).`);
+    } else {
+      heuristic.push(`Base stayed near the opening offer of $${openingOfferBase.toLocaleString()} — the final package was $${finalOffer.base.toLocaleString()}.`);
+    }
+  }
+  if (outcome === "walked_away" || outcome === "rejected") base = Math.min(base, 45);
+  if (outcome === "accepted") base = Math.min(base + 4, 92);
+
+  // Activity-based signals from the canonical event log.
+  const userEvents = liveEvents.filter((e) => e.actor === "user");
+  const types = new Set(userEvents.map((e) => e.type));
+  if (types.has("leverage_introduced")) {
+    base = Math.min(base + 6, 95);
+    heuristic.push("You introduced leverage (e.g. a competing offer) during the call.");
+  }
+  if (types.has("concession")) heuristic.push("You made at least one explicit concession.");
+  const userTurns = transcript.filter((t) => t.role === "user").length;
+  if (userTurns === 0) {
+    heuristic.push("No candidate speech was captured — the score reflects an empty call.");
+    base = Math.min(base, 20);
+  }
+
+  const notes =
+    heuristic.length > 0
+      ? heuristic
+      : ["Not enough structured activity was detected to evaluate specific moves."];
+
+  return {
+    overall_score: Math.max(0, Math.min(100, Math.round(base))),
+    rubric: (
+      [
+        ["Anchoring", 0.2],
+        ["Leverage", 0.2],
+        ["Information Control", 0.2],
+        ["Concession Management", 0.2],
+        ["Outcome", 0.2],
+      ] as const
+    ).map(([dimension, weight]) => ({
+      dimension,
+      score: Math.max(0, Math.min(10, Math.round(base / 10))),
+      weight,
+      feedback:
+        "Provisional: the coach model was unavailable, so this dimension was estimated from server-verified negotiation activity only, not language quality.",
+    })),
+    strengths: notes.filter((n) => !n.startsWith("Base stayed") && !n.startsWith("No candidate")),
+    improvements: [
+      "This report was generated in fallback mode (the scoring service was unavailable). Retry scoring once service is restored for full evidence-based coaching.",
+      ...notes.filter((n) => n.startsWith("Base stayed") || n.startsWith("No candidate")),
+    ],
+    communication: null,
+    summary:
+      "Provisional report — the scoring service was unreachable, so this score is a heuristic estimate from the server-verified outcome and detected events. Your full transcript and timeline are intact below.",
+    outcome: outcome ?? "stalemate",
+    final_offer: finalOffer,
+    events: liveEvents,
+    transcript: transcript.map((t) => ({
+      role: t.role,
+      text: t.text,
+      interrupted: t.interrupted,
+      at_ms: t.atMs,
+    })),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Main scoring entry
 // ---------------------------------------------------------------------------
 
@@ -358,11 +450,17 @@ Score the CANDIDATE now. Every dimension feedback MUST cite or closely paraphras
 
   // Overall: model-provided when present, otherwise computed from the rubric
   // (each dimension is 0–10 → average × 10 = 0–100).
-  const overall =
+  let overall: number =
     out.overall_score ??
     (rubric.length
       ? Math.round((rubric.reduce((s, d) => s + d.score, 0) / rubric.length) * 10)
       : 0);
+  // Scale guard: models occasionally ignore the 0–100 instruction and emit a
+  // 0–10 overall (matching the rubric's scale). A genuine 0–100 score ≤ 10
+  // effectively never happens for a completed call, so treat ≤ 10 as 0–10 ×10.
+  if (out.overall_score != null && overall <= 10) {
+    overall *= 10;
+  }
 
   return {
     overall_score: Math.max(0, Math.min(100, Math.round(overall))),

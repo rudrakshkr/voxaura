@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 import { ApiError, handle } from "@/lib/api";
-import { scoreAttempt } from "@/lib/ai/score";
+import { degradedReport, scoreAttempt } from "@/lib/ai/score";
 import { getSessionTimeline } from "@/lib/assemblyai/sessions";
 import {
   finishAttempt,
@@ -85,8 +85,11 @@ export const POST = handle(
     }
 
     // 3. Score with full evidence (engine state + hidden economics).
+    //    If every LLM provider is down (out of credits, outage), fall back to
+    //    a clearly-labeled heuristic report instead of failing the request —
+    //    the user keeps their transcript, timeline, and outcome either way.
     const { effectiveHidden } = hydrateAttempt(attempt, scenario);
-    const report = await scoreAttempt({
+    const scoreInput = {
       transcript,
       liveEvents: events.map((e) => ({
         type: e.type as never,
@@ -101,7 +104,20 @@ export const POST = handle(
       finalOffer,
       outcome,
       openingOfferBase: effectiveHidden.opening_anchor,
-    });
+    };
+    let report;
+    try {
+      report = await scoreAttempt(scoreInput);
+    } catch (err) {
+      console.error("[complete] scoring unavailable, using degraded report:", err);
+      report = degradedReport(
+        transcript,
+        scoreInput.liveEvents,
+        finalOffer,
+        outcome,
+        effectiveHidden.opening_anchor,
+      );
+    }
 
     // 4. Persist report + any extracted events the scorer recovered.
     await saveReport(id, report);

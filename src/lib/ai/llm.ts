@@ -52,6 +52,15 @@ function makeProvider(name: "openai" | "groq", apiKey: string, model: string, ba
   };
 }
 
+/**
+ * In-memory provider cooldown. After a billing/quota failure (401/402/429)
+ * the provider is skipped for COOLDOWN_MS so every subsequent call in this
+ * server instance starts directly at the healthy provider instead of paying
+ * the failed provider's round-trip (and retry) each time.
+ */
+const providerCooldownUntil = new Map<string, number>();
+const PROVIDER_COOLDOWN_MS = 5 * 60_000;
+
 /** Build the provider chain from env. OpenAI first, Groq as free fallback. */
 function providerChain(): Provider[] {
   const e = env();
@@ -76,7 +85,9 @@ function providerChain(): Provider[] {
   if (groqReady) {
     providers.push(makeProvider("groq", e.GROQ_API_KEY!, e.GROQ_MODEL, "https://api.groq.com/openai/v1"));
   }
-  return providers;
+  // Drop providers currently in a billing/quota cooldown.
+  const now = Date.now();
+  return providers.filter((p) => (providerCooldownUntil.get(p.name) ?? 0) <= now);
 }
 
 /** True when at least one LLM provider is configured (used to gate features). */
@@ -153,7 +164,15 @@ async function callProvider(p: Provider, args: JsonCallArgs): Promise<JsonCallRe
 
 /** Run a JSON structured call across the provider chain. */
 export async function callJson(args: JsonCallArgs): Promise<JsonCallResult> {
-  const chain = providerChain();
+  let chain = providerChain();
+  if (chain.length === 0) {
+    // Everything is in cooldown — rather than refusing, retry the full chain:
+    // the cooldown may have outlived the actual outage.
+    const e = env();
+    if (e.OPENAI_API_KEY) chain = [makeProvider("openai", e.OPENAI_API_KEY, e.LLM_MODEL)];
+    if (e.GROQ_API_KEY)
+      chain.push(makeProvider("groq", e.GROQ_API_KEY, e.GROQ_MODEL, "https://api.groq.com/openai/v1"));
+  }
   if (chain.length === 0) {
     throw new LlmUnavailableError(
       "No LLM provider configured. Set OPENAI_API_KEY (paid) or GROQ_API_KEY (free tier at console.groq.com), or set AI_DEBUG=1.",
@@ -167,7 +186,8 @@ export async function callJson(args: JsonCallArgs): Promise<JsonCallResult> {
     } catch (err) {
       failures.push(describe(err, p));
       if (isBillingOrQuota(err)) {
-        console.warn(`[llm] ${p.name} unavailable (billing/quota), trying next provider…`);
+        providerCooldownUntil.set(p.name, Date.now() + PROVIDER_COOLDOWN_MS);
+        console.warn(`[llm] ${p.name} unavailable (billing/quota) — cooling down ${PROVIDER_COOLDOWN_MS / 1000}s, trying next provider…`);
       } else {
         console.warn(`[llm] ${p.name} call failed, trying next provider…`, err);
       }
