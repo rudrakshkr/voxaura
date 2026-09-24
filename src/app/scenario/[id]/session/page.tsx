@@ -20,6 +20,7 @@ export default function SessionPage() {
   const mode = (params.get("mode") ?? "stored") as "stored" | "inline";
   const agentIdParam = params.get("agent") || null;
   const promptParam = params.get("prompt") || null;
+  const greetingParam = params.get("greeting") || null;
 
   const [detail, setDetail] = useState<AttemptDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -81,11 +82,18 @@ export default function SessionPage() {
   }
 
   // Build inline config after the blocked check (detail is guaranteed non-null
-  // here). When the attempts endpoint fell back to inline mode it already sent
-  // the system_prompt; otherwise fall back to the scenario prep pack.
+  // here). The greeting is resolved from the attempt detail (server-derived from
+  // the attempt's own hidden state), then the URL, then the scenario. An empty
+  // greeting is never sent: the agent would stay silent and the user would be
+  // left talking into a dead line.
+  const greeting =
+    detail.attempt.greeting ??
+    greetingParam ??
+    detail.scenario.prep_pack.greeting ??
+    "Hi, thanks for taking my call — I want to walk through the offer with you. Ready when you are.";
   const inlineConfig =
     mode === "inline" && promptParam
-      ? ({ systemPrompt: promptParam, greeting: detail.attempt.greeting ?? detail.scenario.prep_pack.greeting ?? "" } as const)
+      ? ({ systemPrompt: promptParam, greeting } as const)
       : null;
 
   return (

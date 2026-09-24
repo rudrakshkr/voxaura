@@ -55,6 +55,7 @@ export default function ScenarioPrepPage() {
       params.set("mode", data.agent_mode);
       if (data.agent_id) params.set("agent", data.agent_id);
       if (data.system_prompt) params.set("prompt", data.system_prompt);
+      if (data.greeting) params.set("greeting", data.greeting);
       router.push(`/scenario/${id}/session?${params.toString()}`);
     } catch (err) {
       setError((err as Error).message);
