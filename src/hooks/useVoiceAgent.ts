@@ -123,6 +123,27 @@ export interface InlineAgentConfig {
   greeting: string;
 }
 
+/**
+ * The `session.update` body for inline (non-stored) agents. One builder so the
+ * initial handshake and a post-resume re-attach can never drift apart.
+ * The greeting is skipped when re-attaching: it already played once.
+ */
+function inlineSessionPayload(cfg: InlineAgentConfig, opts?: { includeGreeting?: boolean }) {
+  return {
+    system_prompt: cfg.systemPrompt,
+    ...(opts?.includeGreeting === false ? {} : { greeting: cfg.greeting }),
+    output: { voice: "anna" },
+    tools: OPPONENT_TOOLS,
+    input: {
+      turn_detection: {
+        min_silence: 700,
+        max_silence: 1600,
+        interrupt_response: true,
+      },
+    },
+  };
+}
+
 const MAX_SESSION_SEC = 10 * 60; // client-side guard; server TTL gives no warning
 const MicBufferSamples = 4096; // ~170ms at 24 kHz per WS message
 const RESUME_GRACE_MS = 25_000; // server holds sessions for 30s after drop
@@ -185,6 +206,14 @@ export function useVoiceAgent(args: {
   const greetingTimerRef = useRef<number | null>(null);
   // True once the mic stream is open (pre-flight or post-ready).
   const micReadyRef = useRef(false);
+  // True while getUserMedia is pending — stops session.ready from firing a
+  // second permission request when it lands before the grant.
+  const micStartingRef = useRef(false);
+  // One fresh-session restart per call is allowed when a resume turns out to
+  // reference a session whose grace window has already expired.
+  const freshRetriedRef = useRef(false);
+  // True while we deliberately tear the socket down to restart a fresh call.
+  const restartingRef = useRef(false);
   // True when the failure came from session setup (bad config / rejected
   // update) rather than the transport — lets onclose keep the better message.
   const setupFailRef = useRef(false);
@@ -411,6 +440,50 @@ export function useVoiceAgent(args: {
     [clearSetupTimers, patch],
   );
 
+  /**
+   * Single source of truth for mic → WS framing.
+   *
+   * This logic used to be duplicated at ws.onopen and session.ready, and the
+   * onopen copy never stored the merged buffer, so the flush threshold was
+   * never reached and NO audio was ever transmitted — the agent was deaf while
+   * the call looked healthy. One callback keeps the copies from drifting.
+   */
+  const onMicChunk = useCallback(
+    (pcm: Int16Array) => {
+      const merged = new Int16Array(micBufRef.current.length + pcm.length);
+      merged.set(micBufRef.current);
+      merged.set(pcm, micBufRef.current.length);
+      micBufRef.current = merged;
+      // Coalesce small worklet frames into ~170ms WS messages.
+      if (micBufRef.current.length >= MicBufferSamples) {
+        send({ type: "input.audio", audio: base64EncodePCM(micBufRef.current) });
+        micBufRef.current = new Int16Array(0);
+      }
+    },
+    [send],
+  );
+
+  /** Open the mic once (idempotent) and surface permission failures clearly. */
+  const startMic = useCallback((): void => {
+    if (micReadyRef.current || micStartingRef.current) return;
+    micStartingRef.current = true;
+    void mic
+      .start({ onChunk: onMicChunk })
+      .then(() => {
+        micReadyRef.current = true;
+      })
+      .catch(() => {
+        if (statusRef.current !== "ended") {
+          failSetup(
+            "Microphone access was blocked. Allow the mic in your browser's address-bar settings, then try again.",
+          );
+        }
+      })
+      .finally(() => {
+        micStartingRef.current = false;
+      });
+  }, [failSetup, mic, onMicChunk]);
+
   const connectInner = useCallback(
     async (resumeSessionId: string | null) => {
       const a = argsRef.current;
@@ -447,54 +520,23 @@ export function useVoiceAgent(args: {
         // handshake. First-time users grant while the session spins up instead
         // of hitting a second prompt after ready. A denial here fails fast with
         // a specific message rather than a deaf call.
-        mic
-          .start({
-            onChunk: (pcm) => {
-              const merged = new Int16Array(micBufRef.current.length + pcm.length);
-              merged.set(micBufRef.current);
-              merged.set(pcm, micBufRef.current.length);
-              if (micBufRef.current.length >= MicBufferSamples) {
-                micBufRef.current = new Int16Array(0);
-                send({ type: "input.audio", audio: base64EncodePCM(merged) });
-              }
-            },
-          })
-          .then(() => {
-            micReadyRef.current = true;
-          })
-          .catch(() => {
-            if (statusRef.current !== "ended") {
-              failSetup(
-                "Microphone access was blocked. Allow the mic in your browser's address-bar settings, then try again.",
-              );
-            }
-          });
+        startMic();
 
         if (resumeSessionId) {
           send({ type: "session.resume", session_id: resumeSessionId });
           // Re-attach the agent config after resume (some servers drop it).
           if (a.agentMode === "stored" && a.agentId) {
             send({ type: "session.update", session: { agent_id: a.agentId, output: { voice: "anna" } } });
+          } else if (a.agentMode === "inline" && a.inlineConfig) {
+            send({
+              type: "session.update",
+              session: inlineSessionPayload(a.inlineConfig, { includeGreeting: false }),
+            });
           }
         } else if (a.agentMode === "stored" && a.agentId) {
           send({ type: "session.update", session: { agent_id: a.agentId, output: { voice: "anna" } } });
         } else if (a.agentMode === "inline" && a.inlineConfig) {
-          send({
-            type: "session.update",
-            session: {
-              system_prompt: a.inlineConfig.systemPrompt,
-              greeting: a.inlineConfig.greeting,
-              output: { voice: "anna" },
-              tools: OPPONENT_TOOLS,
-              input: {
-                turn_detection: {
-                  min_silence: 700,
-                  max_silence: 1600,
-                  interrupt_response: true,
-                },
-              },
-            },
-          });
+          send({ type: "session.update", session: inlineSessionPayload(a.inlineConfig) });
         } else {
           patch({ status: "error", error: "No agent configuration available" });
           ws.close();
@@ -502,6 +544,9 @@ export function useVoiceAgent(args: {
       };
 
       ws.onmessage = (ev: MessageEvent<string>) => {
+        // Events from a socket we already replaced are stale — ignore them so a
+        // dying connection's error can't fail the fresh one.
+        if (ws !== wsRef.current) return;
         let event: VoiceAgentEvent;
         try {
           event = JSON.parse(ev.data) as VoiceAgentEvent;
@@ -512,6 +557,9 @@ export function useVoiceAgent(args: {
       };
 
       ws.onclose = (ev: CloseEvent) => {
+        // We tore this socket down on purpose to restart a fresh session (or
+        // it was already replaced) — don't report our own close as a failure.
+        if (restartingRef.current || ws !== wsRef.current) return;
         if (closedCleanlyRef.current || endedByUsRef.current) {
           patch({ status: "ended" });
           return;
@@ -580,35 +628,10 @@ export function useVoiceAgent(args: {
             clearSetupTimers();
             patch({ status: "ready", sessionId: event.session_id });
             startedAtRef.current = Date.now();
-            // Mic capture was already started at ws.onopen (pre-flight); if
-            // the permission prompt is somehow still pending, finish opening
-            // it here — start() is idempotent.
-            if (!micReadyRef.current) {
-              void mic
-                .start({
-                  onChunk: (pcm) => {
-                    // Coalesce small worklet frames into ~170ms WS messages.
-                    const merged = new Int16Array(micBufRef.current.length + pcm.length);
-                    merged.set(micBufRef.current);
-                    merged.set(pcm, micBufRef.current.length);
-                    micBufRef.current = merged;
-                    if (micBufRef.current.length >= MicBufferSamples) {
-                      send({ type: "input.audio", audio: base64EncodePCM(micBufRef.current) });
-                      micBufRef.current = new Int16Array(0);
-                    }
-                  },
-                })
-                .then(() => {
-                  micReadyRef.current = true;
-                })
-                .catch(() => {
-                  if (statusRef.current !== "ended") {
-                    failSetup(
-                      "Microphone access was blocked. Allow the mic in your browser's address-bar settings, then try again.",
-                    );
-                  }
-                });
-            }
+            // Mic capture was already started at ws.onopen (pre-flight). If
+            // that start is still pending, startMic() is a no-op and the
+            // original handler keeps streaming into this socket.
+            startMic();
             // Greeting watchdog: if the recruiter never speaks (rejected
             // config, silent TTS failure), fail visibly instead of silence.
             greetingTimerRef.current = window.setTimeout(() => {
@@ -716,6 +739,38 @@ export function useVoiceAgent(args: {
           }
 
           case "session.error": {
+            // A resumed session that no longer exists can never be salvaged —
+            // its grace window is gone. Restart a fresh call once rather than
+            // dead-ending the user on a raw protocol error.
+            if (
+              event.code === "session_not_found" &&
+              !freshRetriedRef.current &&
+              !endedByUsRef.current
+            ) {
+              freshRetriedRef.current = true;
+              resumedOnceRef.current = true; // never resume this dead session again
+              restartingRef.current = true;
+              clearSetupTimers();
+              const dead = wsRef.current;
+              if (dead && dead.readyState <= WebSocket.OPEN) {
+                try {
+                  dead.close();
+                } catch {
+                  // ignore
+                }
+              }
+              patch({ status: "reconnecting", error: null });
+              window.setTimeout(() => {
+                void connectInner(null)
+                  .catch((err) => {
+                    patch({ status: "error", error: (err as Error).message });
+                  })
+                  .finally(() => {
+                    restartingRef.current = false;
+                  });
+              }, 300);
+              break;
+            }
             const fatal = !["at_capacity", "concurrency_exceeded", "internal_error"].includes(
               event.code,
             );
@@ -729,7 +784,17 @@ export function useVoiceAgent(args: {
         }
       }
     },
-    [flushPendingTools, mic, maybeDispatchPendingTurn, patch, playback, queueEvent, runTool, send],
+    [
+      clearSetupTimers,
+      flushPendingTools,
+      maybeDispatchPendingTurn,
+      patch,
+      playback,
+      queueEvent,
+      runTool,
+      send,
+      startMic,
+    ],
   );
 
   // ---------------------------------------------------------------------------
@@ -742,6 +807,9 @@ export function useVoiceAgent(args: {
     // Fresh attempt: reset per-connection failure tracking and audio state.
     setupFailRef.current = false;
     micReadyRef.current = false;
+    micStartingRef.current = false;
+    freshRetriedRef.current = false;
+    restartingRef.current = false;
     resumedOnceRef.current = false;
     closedCleanlyRef.current = false;
     endedByUsRef.current = false;
