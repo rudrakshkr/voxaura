@@ -116,6 +116,14 @@ export interface VoiceAgentState {
   acceptedOffer: CompPackage | null;
   offerConditions: string[];
   elapsedSec: number;
+  /**
+   * Non-fatal call-health warning. A live-looking connection that transmits no
+   * microphone audio is indistinguishable from a working call without this, so
+   * the agent being deaf must be visible to the user.
+   */
+  audioWarning: string | null;
+  /** True when mic frames actually reached the call in the last ~1.5s. */
+  audioFlowing: boolean;
 }
 
 export interface InlineAgentConfig {
@@ -146,6 +154,8 @@ function inlineSessionPayload(cfg: InlineAgentConfig, opts?: { includeGreeting?:
 
 const MAX_SESSION_SEC = 10 * 60; // client-side guard; server TTL gives no warning
 const MicBufferSamples = 4096; // ~170ms at 24 kHz per WS message
+const AUDIO_SILENCE_MS = 6000; // ready but no frames transmitted this long => warn
+const AUDIO_FLOWING_MS = 1500; // frames this recent count as "audio is flowing"
 const RESUME_GRACE_MS = 25_000; // server holds sessions for 30s after drop
 const SETUP_TIMEOUT_MS = 15_000; // token + WS + session.ready must land within this
 const MIC_READY_TIMEOUT_MS = 10_000; // first-time mic permission can be slow, not infinite
@@ -171,6 +181,8 @@ export function useVoiceAgent(args: {
     acceptedOffer: null,
     offerConditions: [],
     elapsedSec: 0,
+    audioWarning: null,
+    audioFlowing: false,
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -188,6 +200,17 @@ export function useVoiceAgent(args: {
 
   // Mic chunk coalescing buffer.
   const micBufRef = useRef<Int16Array>(new Int16Array(0));
+
+  // Live audio-flow health. `chunks` counts frames the mic produced and `sent`
+  // counts input.audio messages that actually left the browser — the two
+  // drifting apart is exactly the failure mode this exists to catch.
+  const audioStatsRef = useRef({ chunks: 0, sent: 0, lastSentAt: 0 });
+  // Last values pushed to state, so the 1s watchdog doesn't re-render needlessly.
+  const audioWarnRef = useRef<string | null>(null);
+  const audioFlowRef = useRef(false);
+  // Set when a check was skipped because the tab was hidden, so capture gets a
+  // fresh window to resume before we judge it.
+  const hiddenSkipRef = useRef(false);
 
   // Event batch queue for the attempts API.
   const eventQueueRef = useRef<BatchedEvent[]>([]);
@@ -450,6 +473,7 @@ export function useVoiceAgent(args: {
    */
   const onMicChunk = useCallback(
     (pcm: Int16Array) => {
+      audioStatsRef.current.chunks += 1;
       const merged = new Int16Array(micBufRef.current.length + pcm.length);
       merged.set(micBufRef.current);
       merged.set(pcm, micBufRef.current.length);
@@ -457,6 +481,8 @@ export function useVoiceAgent(args: {
       // Coalesce small worklet frames into ~170ms WS messages.
       if (micBufRef.current.length >= MicBufferSamples) {
         send({ type: "input.audio", audio: base64EncodePCM(micBufRef.current) });
+        audioStatsRef.current.sent += 1;
+        audioStatsRef.current.lastSentAt = Date.now();
         micBufRef.current = new Int16Array(0);
       }
     },
@@ -813,7 +839,10 @@ export function useVoiceAgent(args: {
     resumedOnceRef.current = false;
     closedCleanlyRef.current = false;
     endedByUsRef.current = false;
-    patch({ status: "connecting", error: null });
+    audioStatsRef.current = { chunks: 0, sent: 0, lastSentAt: 0 };
+    audioWarnRef.current = null;
+    audioFlowRef.current = false;
+    patch({ status: "connecting", error: null, audioWarning: null, audioFlowing: false });
     try {
       await connectInner(null);
     } catch (err) {
@@ -836,8 +865,60 @@ export function useVoiceAgent(args: {
     if (ws && ws.readyState === WebSocket.OPEN) {
       window.setTimeout(() => ws.close(), 500);
     }
-    patch({ status: "ended", agentSpeaking: false, userSpeaking: false });
+    patch({
+      status: "ended",
+      agentSpeaking: false,
+      userSpeaking: false,
+      audioFlowing: false,
+      audioWarning: null,
+    });
   }, [flushEvents, mic, patch, playback, send]);
+
+  /**
+   * Replace the live socket with a brand-new session on the same attempt.
+   * Used when the call is healthy-looking but broken (e.g. the mic is
+   * transmitting nothing): rebuilding the AudioContext and the session is the
+   * reliable fix, and the transcript collected so far is preserved.
+   */
+  const restart = useCallback(() => {
+    if (restartingRef.current) return;
+    restartingRef.current = true;
+    clearSetupTimers();
+    mic.stop(); // force a fresh AudioContext + stream on reconnect
+    micReadyRef.current = false;
+    micStartingRef.current = false;
+    micBufRef.current = new Int16Array(0);
+    audioStatsRef.current = { chunks: 0, sent: 0, lastSentAt: 0 };
+    audioWarnRef.current = null;
+    audioFlowRef.current = false;
+    playback.flush();
+    const old = wsRef.current;
+    if (old && old.readyState <= WebSocket.OPEN) {
+      try {
+        old.close();
+      } catch {
+        // ignore
+      }
+    }
+    patch({
+      status: "connecting",
+      error: null,
+      audioWarning: null,
+      audioFlowing: false,
+      agentSpeaking: false,
+      userSpeaking: false,
+      justInterrupted: false,
+    });
+    window.setTimeout(() => {
+      void connectInner(null)
+        .catch((err) => {
+          patch({ status: "error", error: (err as Error).message });
+        })
+        .finally(() => {
+          restartingRef.current = false;
+        });
+    }, 300);
+  }, [clearSetupTimers, connectInner, mic, patch, playback]);
 
   // Elapsed timer.
   useEffect(() => {
@@ -871,6 +952,57 @@ export function useVoiceAgent(args: {
     }
   }, [state.userSpeaking, state.justInterrupted, patch]);
 
+  /**
+   * Audio-flow self-check.
+   *
+   * A connection that is perfectly healthy but carries no microphone audio is
+   * indistinguishable from a working call, so "ready" alone proves nothing.
+   * This watches the frames that actually left the browser and tells the user
+   * the moment the agent is deaf, with a one-click rebuild.
+   */
+  useEffect(() => {
+    if (state.status !== "ready") return;
+    const t = window.setInterval(() => {
+      const now = Date.now();
+      // Browsers throttle audio worklets in hidden tabs — don't cry wolf.
+      if (document.visibilityState !== "visible") {
+        hiddenSkipRef.current = true;
+        return;
+      }
+      if (hiddenSkipRef.current) {
+        // Back from a hidden tab: re-baseline so capture can restart before we
+        // count the missed time against the user.
+        hiddenSkipRef.current = false;
+        audioStatsRef.current.lastSentAt = now;
+        return;
+      }
+      const s = audioStatsRef.current;
+      const flowing = now - s.lastSentAt < AUDIO_FLOWING_MS;
+      const silentFor = now - (s.lastSentAt || startedAtRef.current || now);
+
+      let warning: string | null = null;
+      if (!flowing && silentFor > AUDIO_SILENCE_MS) {
+        if (s.chunks === 0) {
+          warning =
+            "Your microphone isn't sending any audio. Check that it isn't muted and that the right input device is selected, then restart the call.";
+        } else if (s.sent === 0) {
+          warning =
+            "Your microphone is capturing audio but none of it is reaching the call. Restarting the call usually fixes this.";
+        } else {
+          warning =
+            "Microphone audio stopped a few seconds ago — the device may have been disconnected, or your browser paused capture. Restarting the call usually reconnects it.";
+        }
+      }
+
+      // Only touch state on a real change: this runs every second.
+      if (warning === audioWarnRef.current && flowing === audioFlowRef.current) return;
+      audioWarnRef.current = warning;
+      audioFlowRef.current = flowing;
+      patch({ audioWarning: warning, audioFlowing: flowing });
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [state.status, patch]);
+
   // Cleanup on unmount.
   useEffect(() => {
     return () => {
@@ -890,5 +1022,5 @@ export function useVoiceAgent(args: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { state, connect, end, flushEvents };
+  return { state, connect, end, restart, flushEvents };
 }

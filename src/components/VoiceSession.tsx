@@ -19,7 +19,7 @@ import type { ScenarioPublic } from "@/lib/types";interface Props {
 }
 export function VoiceSession(props: Props) {
   const router = useRouter();
-  const { state, connect, end } = useVoiceAgent({
+  const { state, connect, end, restart } = useVoiceAgent({
     attemptId: props.attemptId,
     agentId: props.agentId,
     agentMode: props.agentMode,
@@ -118,7 +118,29 @@ export function VoiceSession(props: Props) {
         recruiterThinking={state.recruiterThinking}
         justInterrupted={state.justInterrupted}
         elapsedSec={state.elapsedSec}
+        audioFlowing={state.audioFlowing}
       />
+
+      {/* The call can look perfectly healthy while the agent receives no audio.
+          Surface that the moment it's detected instead of letting the user
+          talk into a dead line. */}
+      {state.audioWarning && state.status === "ready" && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <p className="font-medium">The recruiter may not be hearing you</p>
+          <p className="mt-1 text-amber-100/80">{state.audioWarning}</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button className="btn btn-primary" onClick={restart}>
+              Restart the call
+            </button>
+            <Link href={`/scenario/${props.scenario.id}`} className="btn btn-ghost">
+              Change microphone setup
+            </Link>
+          </div>
+          <p className="mt-2 text-xs text-amber-100/60">
+            Restarting keeps your transcript and this attempt — the recruiter will greet you again.
+          </p>
+        </div>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
         <div className="space-y-4">

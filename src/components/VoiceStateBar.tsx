@@ -12,11 +12,14 @@ interface Props {
   recruiterThinking: boolean;
   justInterrupted: boolean;
   elapsedSec: number;
+  /** True when microphone frames actually reached the call recently. */
+  audioFlowing: boolean;
 }
 
 /**
  * Compact voice-state strip for the live call. One glance tells you:
- * connection state, who is speaking, and whether the recruiter is composing.
+ * connection state, who is speaking, whether the recruiter is composing, and
+ * — crucially — whether the call is actually receiving microphone audio.
  */
 export function VoiceStateBar(props: Props) {
   const live = props.status === "ready";
@@ -65,11 +68,40 @@ export function VoiceStateBar(props: Props) {
         <div>
           <p className={clsx("text-sm font-medium", stateCls)}>{stateLabel}</p>
           <p className="text-xs text-white/35">
-            {live ? "Live connection" : props.status === "idle" ? "Not connected" : props.status}
+            {live
+              ? props.audioFlowing
+                ? "Live · microphone sending audio"
+                : "Live · waiting for microphone audio"
+              : props.status === "idle"
+                ? "Not connected"
+                : props.status}
           </p>
         </div>
       </div>
-      <span className="font-mono text-lg text-white/80">{fmtTime(props.elapsedSec)}</span>
+      <div className="flex items-center gap-3">
+        {live && (
+          <span
+            className={clsx(
+              "flex items-center gap-1.5 text-xs",
+              props.audioFlowing ? "text-emerald-300" : "text-amber-300",
+            )}
+            title={
+              props.audioFlowing
+                ? "Microphone audio is reaching the call"
+                : "No microphone audio is reaching the call yet"
+            }
+          >
+            <span
+              className={clsx(
+                "h-1.5 w-1.5 rounded-full",
+                props.audioFlowing ? "bg-emerald-400" : "bg-amber-400",
+              )}
+            />
+            mic
+          </span>
+        )}
+        <span className="font-mono text-lg text-white/80">{fmtTime(props.elapsedSec)}</span>
+      </div>
     </div>
   );
 }
