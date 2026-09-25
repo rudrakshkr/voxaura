@@ -431,7 +431,14 @@ export function deriveVariant(
   return hidden;
 }
 
-/** Build the stored-agent system prompt for a scenario/variant. */
-export function agentPromptFor(hidden: HiddenState): string {
-  return buildOpponentPrompt(hidden);
+/**
+ * Build the stored-agent system prompt for a scenario/variant. Scenario facts
+ * (company/role/level/situation) are public prep data; without them the voice
+ * model invents employers and roles mid-call.
+ */
+export function agentPromptFor(
+  hidden: HiddenState,
+  facts?: { company: string; role: string; level: string; context?: string | null },
+): string {
+  return buildOpponentPrompt(hidden, facts);
 }

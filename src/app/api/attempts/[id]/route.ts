@@ -47,7 +47,11 @@ export const GET = handle(
         outcome: attempt.outcome,
         final_offer: attempt.final_offer,
         retry_mode: attempt.retry_mode,
-        greeting: buildGreeting(hidden),
+        greeting: buildGreeting(hidden, {
+          company: scenario.company,
+          role: scenario.role,
+          level: scenario.level,
+        }),
         started_at: attempt.started_at.toISOString(),
         ended_at: attempt.ended_at?.toISOString() ?? null,
       },

@@ -32,8 +32,17 @@ export const POST = handle(async (req: Request) => {
     retryMode: body.data.retry_mode ?? null,
   });
 
-  const systemPrompt = agentPromptFor(effectiveHidden);
-  const greeting = buildGreeting(effectiveHidden);
+  const systemPrompt = agentPromptFor(effectiveHidden, {
+    company: scenario.company,
+    role: scenario.role,
+    level: scenario.level,
+    context: (scenario.prep_pack as { context?: string }).context ?? null,
+  });
+  const greeting = buildGreeting(effectiveHidden, {
+    company: scenario.company,
+    role: scenario.role,
+    level: scenario.level,
+  });
   let agentId: string | null = null;
   let agentMode: "stored" | "inline" = "stored";
 

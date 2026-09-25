@@ -21,8 +21,17 @@ export const GET = handle(
     const { attempt, scenario } = await getAttemptWithScenario(id);
     const { effectiveHidden } = hydrateAttempt(attempt, scenario);
     return Response.json({
-      system_prompt: agentPromptFor(effectiveHidden),
-      greeting: buildGreeting(effectiveHidden),
+      system_prompt: agentPromptFor(effectiveHidden, {
+        company: scenario.company,
+        role: scenario.role,
+        level: scenario.level,
+        context: (scenario.prep_pack as { context?: string }).context ?? null,
+      }),
+      greeting: buildGreeting(effectiveHidden, {
+        company: scenario.company,
+        role: scenario.role,
+        level: scenario.level,
+      }),
     });
   },
 );

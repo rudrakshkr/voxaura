@@ -637,6 +637,14 @@ export interface TurnDirective {
   allowedNumbers: number[];
   askUserQuestion: string | null;
   conditions: string[];
+  /**
+   * One factual sentence stating the exact package currently on the table.
+   * Included in EVERY directive by buildDirective (always set on the public
+   * path): without it the voice model restates its stale opening from memory
+   * when the candidate questions the numbers, and the spoken total drifts
+   * from the authoritative panel.
+   */
+  standingOfferLine?: string | null;
   toolHint: { offer?: { base_salary: number; sign_on?: number; equity?: number; notes?: string } | { final_base: number; sign_on?: number; equity?: number }; accept?: boolean } | null;
 }
 
@@ -647,8 +655,9 @@ interface DirectiveOpts {
 
 /**
  * Public entry point. Wraps the move-specific directive with rules that apply
- * to every turn (no deferrals) and lets a hold-firm turn restate the standing
- * package without moving it.
+ * to every turn (no deferrals) and the standing-package facts (what is on the
+ * table right now, in exact components, so the model never restates a stale
+ * or improvised package).
  */
 export function buildDirective(
   move: RecruiterMove,
@@ -657,6 +666,17 @@ export function buildDirective(
 ): TurnDirective {
   const d = buildDirectiveInner(move, hidden, opts);
   if (!d.mustNotSay.includes(NO_DEFERRAL_RULE)) d.mustNotSay.push(NO_DEFERRAL_RULE);
+  // The standing package travels with every directive. On counter/trade/accept
+  // turns it describes the package the move just put forward; on every other
+  // turn it is the last package actually offered, which is the only set of
+  // numbers the model may restate when the candidate asks "isn't it X now?".
+  const standing =
+    move.kind === "counter" || move.kind === "trade" || move.kind === "accept" || move.kind === "recover_from_walkaway"
+      ? move.package
+      : (opts.standingOffer ?? null);
+  d.standingOfferLine = standing
+    ? `FACT — the package currently on the table is base ${standing.base.toLocaleString("en-US")} dollars${(standing.sign_on ?? 0) > 0 ? `, sign-on ${(standing.sign_on ?? 0).toLocaleString("en-US")} dollars` : ""}${(standing.equity ?? 0) > 0 ? `, annual equity ${(standing.equity ?? 0).toLocaleString("en-US")} dollars` : ""} — a first-year total of ${total(standing).toLocaleString("en-US")} dollars. If the candidate asks about current numbers, these (and only these) are correct; any other figures you remember from earlier are outdated and must not be repeated.`
+    : null;
   return d;
 }
 
@@ -749,7 +769,9 @@ function buildDirectiveInner(
       return {
         verdict: "PROBE — no numbers move; gather information.",
         mustSay: ["Ask the candidate the question below naturally."],
-        mustNotSay: ["Do not state or restate any offer numbers."],
+        mustNotSay: [
+          "Do not volunteer or move any offer numbers. EXCEPTION: if the candidate asks what is currently on the table, you may restate the FACT package exactly — nothing higher.",
+        ],
         allowedNumbers: [],
         askUserQuestion: move.question,
         conditions: [],

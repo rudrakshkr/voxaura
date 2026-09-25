@@ -471,6 +471,10 @@ export function useVoiceAgent(args: {
         if (!d) return;
 
         const lines: string[] = [`SYSTEM DIRECTIVE (obey exactly): ${d.verdict}`];
+        // The on-table package travels with every directive: the model restates
+        // these exact components when the candidate questions the numbers,
+        // instead of resurrecting its opening offer from memory.
+        if (d.standingOfferLine) lines.push(d.standingOfferLine);
         if (d.allowedNumbers.length > 0) {
           lines.push(
             `ALLOWED NUMBERS this turn (you may say ONLY these, exactly as written): ${d.allowedNumbers.join(", ")}.`,

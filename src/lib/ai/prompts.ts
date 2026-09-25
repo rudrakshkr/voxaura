@@ -1,6 +1,18 @@
 import type { HiddenState } from "../types";
 
 /**
+ * Public, browser-safe scenario facts the recruiter must speak to accurately.
+ * These come from the scenario row (company/role/level/situation) — nothing
+ * confidential — but without them the model invents employers and roles.
+ */
+export interface ScenarioFacts {
+  company: string;
+  role: string;
+  level: string;
+  context?: string | null;
+}
+
+/**
  * Build the opponent system prompt from hidden state. This string NEVER leaves
  * the server in stored-agent mode: it is baked into a stored agent and bound by
  * agent_id only.
@@ -9,12 +21,21 @@ import type { HiddenState } from "../types";
  * economics per turn (whether to move, which numbers are allowed) arrive
  * mid-session as directive messages that MUST be obeyed verbatim.
  */
-export function buildOpponentPrompt(hidden: HiddenState): string {
+export function buildOpponentPrompt(hidden: HiddenState, facts?: ScenarioFacts): string {
   const p = hidden.persona;
   const urgency = hidden.hiring_urgency <= 2 ? "We urgently need this role filled." : hidden.hiring_urgency >= 4 ? "There is no rush; other candidates are in process." : "We would like to close soon but can wait.";
+  const ground = facts
+    ? `
+## The call you are making (ground truth — NEVER contradict or replace it)
+- You work for ${facts.company} and you are hiring for the ${facts.level} ${facts.role} role.
+- Situation: ${facts.context?.trim() || "a standard offer call for this role"}.
+- Any question about the role, team, company, product, process, or interview stage is answered from the facts above, in character.
+- NEVER invent or substitute a different employer, role, team name, product, or seniority. If asked about a detail the situation does not specify (team size, tech stack, office location), answer in broad, plausible terms consistent with ${facts.company} and the ${facts.role} role — never name another company or another position.
+`
+    : "";
   return `
-You are ${p.name}, ${p.title}, calling a job candidate about their compensation offer. This is a realistic, high-stakes salary negotiation on a live voice call.
-
+You are ${p.name}, ${p.title} at ${facts?.company ?? "the hiring company"}, calling a job candidate about their compensation offer for the ${facts ? `${facts.level} ${facts.role}` : "role they interviewed for"}. This is a realistic, high-stakes salary negotiation on a live voice call.
+${ground}
 ## Your personality
 - Style: ${p.style}.
 - Firmness: ${p.aggression} on a scale where 1 is a pushover and 5 is a stone wall.
@@ -78,9 +99,10 @@ Directives override anything below. If no directive is pending, follow the gener
  * engine's starting package). Without it the recruiter has no numbers at all
  * until the first directive arrives, and invents them.
  */
-export function buildGreeting(hidden: HiddenState): string {
+export function buildGreeting(hidden: HiddenState, facts?: ScenarioFacts): string {
   const base = hidden.opening_anchor.toLocaleString("en-US");
-  return `Hi, this is ${hidden.persona.name} calling about your offer. I'm opening at ${base} base, and there may be room to talk about the rest of the package — ready to walk through it?`;
+  const from = facts ? ` from ${facts.company} about the ${facts.level} ${facts.role} offer` : " about your offer";
+  return `Hi, this is ${hidden.persona.name}${from}. I'm opening at ${base} base, and there may be room to talk about the rest of the package — ready to walk through it?`;
 }
 
 /**

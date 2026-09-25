@@ -180,94 +180,171 @@ export function ScenarioCard({
 
       {editing && (
         <Modal title="Edit scenario" onClose={() => setEditing(false)} wide>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Title">
-              <input
-                className="input"
-                value={draft.title}
-                onChange={(e) => setDraft({ ...draft, title: e.target.value })}
-              />
-            </Field>
-            <Field label="Company">
-              <input
-                className="input"
-                value={draft.company}
-                onChange={(e) => setDraft({ ...draft, company: e.target.value })}
-              />
-            </Field>
-            <Field label="Role">
-              <input
-                className="input"
-                value={draft.role}
-                onChange={(e) => setDraft({ ...draft, role: e.target.value })}
-              />
-            </Field>
-            <Field label="Level">
-              <input
-                className="input"
-                value={draft.level}
-                onChange={(e) => setDraft({ ...draft, level: e.target.value })}
-              />
-            </Field>
-            <Field label="Difficulty">
-              <select
-                className="input"
-                value={draft.difficulty}
-                onChange={(e) => setDraft({ ...draft, difficulty: e.target.value as Difficulty })}
-              >
-                <option value="easy">easy</option>
-                <option value="medium">medium</option>
-                <option value="hard">hard</option>
-              </select>
-            </Field>
-            <Field label="Your target (USD)">
-              <input
-                className="input"
-                type="number"
-                value={draft.your_target}
-                onChange={(e) => setDraft({ ...draft, your_target: Number(e.target.value) })}
-              />
-            </Field>
-            <Field label="Walk away below (USD)">
-              <input
-                className="input"
-                type="number"
-                value={draft.your_reservation}
-                onChange={(e) => setDraft({ ...draft, your_reservation: Number(e.target.value) })}
-              />
-            </Field>
+          {/* Identity strip mirroring the card, so the modal feels anchored. */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-violet-400/20 bg-violet-500/10 px-4 py-3">
+            <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/25 text-base">
+              🎭
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold">{draft.title || "Untitled scenario"}</p>
+              <p className="truncate text-xs text-white/45">
+                {draft.company || "Company"} · {draft.role || "Role"} · {draft.level || "Level"}
+              </p>
+            </div>
+            <span className="badge">{draft.difficulty}</span>
           </div>
 
-          <Field label="The situation" className="mt-4">
-            <textarea
-              className="input min-h-[80px]"
-              value={draft.context}
-              onChange={(e) => setDraft({ ...draft, context: e.target.value })}
-            />
-          </Field>
-          <Field label="Coaching objective" className="mt-4">
-            <textarea
-              className="input min-h-[70px]"
-              value={draft.coaching_objective}
-              onChange={(e) => setDraft({ ...draft, coaching_objective: e.target.value })}
-            />
-          </Field>
-          <Field label="Compensation components" hint="One per line" className="mt-4">
-            <textarea
-              className="input min-h-[90px]"
-              value={draft.comp_notes}
-              onChange={(e) => setDraft({ ...draft, comp_notes: e.target.value })}
-            />
-          </Field>
+          <EditSection step="1" title="The setup" hint="What the candidate sees on the prep screen.">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field label="Title">
+                <input
+                  className="input"
+                  value={draft.title}
+                  onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+                />
+              </Field>
+              <Field label="Company">
+                <input
+                  className="input"
+                  value={draft.company}
+                  onChange={(e) => setDraft({ ...draft, company: e.target.value })}
+                />
+              </Field>
+              <Field label="Role">
+                <input
+                  className="input"
+                  value={draft.role}
+                  onChange={(e) => setDraft({ ...draft, role: e.target.value })}
+                />
+              </Field>
+              <Field label="Level">
+                <input
+                  className="input"
+                  value={draft.level}
+                  onChange={(e) => setDraft({ ...draft, level: e.target.value })}
+                />
+              </Field>
+            </div>
+            <Field label="The situation" className="mt-4">
+              <textarea
+                className="input min-h-[80px]"
+                value={draft.context}
+                onChange={(e) => setDraft({ ...draft, context: e.target.value })}
+              />
+            </Field>
+          </EditSection>
 
-          <p className="mt-3 text-xs text-white/35">
-            The recruiter&apos;s budget, floor and target are not editable here — they never leave
-            the server, which is what keeps the scenario honest.
+          <EditSection
+            step="2"
+            title="Your goals"
+            hint="Private to you — used on the prep screen and in scoring."
+          >
+            <div className="grid grid-cols-3 gap-2">
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                <MoneyStat label="Target" value={draft.your_target} accent="text-violet-200" />
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                <MoneyStat
+                  label="Walk away below"
+                  value={draft.your_reservation}
+                  accent="text-rose-200"
+                />
+              </div>
+              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+                <MoneyStat
+                  label="Stretch gap"
+                  value={Math.max(0, draft.your_target - draft.your_reservation)}
+                  accent="text-emerald-200"
+                />
+              </div>
+            </div>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <Field label="Target (USD/yr)">
+                <input
+                  className="input"
+                  type="number"
+                  step={1000}
+                  value={draft.your_target}
+                  onChange={(e) => setDraft({ ...draft, your_target: Number(e.target.value) })}
+                />
+              </Field>
+              <Field label="Walk away below (USD/yr)">
+                <input
+                  className="input"
+                  type="number"
+                  step={1000}
+                  value={draft.your_reservation}
+                  onChange={(e) => setDraft({ ...draft, your_reservation: Number(e.target.value) })}
+                />
+              </Field>
+            </div>
+            {draft.your_reservation >= draft.your_target && (
+              <p className="mt-2 text-xs text-amber-300">
+                Walk-away number should be below your target — scoring compares against both.
+              </p>
+            )}
+          </EditSection>
+
+          <EditSection
+            step="3"
+            title="Difficulty & compensation"
+            hint="How hard the recruiter fights, and what the offer is made of."
+          >
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-white/40">
+                Difficulty
+              </p>
+              <div className="mt-2 grid grid-cols-3 gap-2">
+                {(["easy", "medium", "hard"] as const).map((d) => {
+                  const on = draft.difficulty === d;
+                  const icon = d === "easy" ? "🌤" : d === "medium" ? "⚔️" : "🔥";
+                  return (
+                    <button
+                      key={d}
+                      type="button"
+                      onClick={() => setDraft({ ...draft, difficulty: d })}
+                      className={[
+                        "rounded-xl border px-3 py-2.5 text-left transition",
+                        on
+                          ? "border-violet-400/60 bg-violet-500/20"
+                          : "border-white/10 hover:border-white/25",
+                      ].join(" ")}
+                    >
+                      <span className="text-base">{icon}</span>
+                      <span className="mt-0.5 block text-xs font-semibold capitalize">{d}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <Field label="Coaching objective" className="mt-4">
+              <textarea
+                className="input min-h-[70px]"
+                value={draft.coaching_objective}
+                onChange={(e) => setDraft({ ...draft, coaching_objective: e.target.value })}
+              />
+            </Field>
+            <Field
+              label="Compensation components"
+              hint="One per line — shown on the prep screen as what exists"
+              className="mt-4"
+            >
+              <textarea
+                className="input min-h-[90px]"
+                value={draft.comp_notes}
+                onChange={(e) => setDraft({ ...draft, comp_notes: e.target.value })}
+              />
+            </Field>
+          </EditSection>
+
+          <p className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-white/35">
+            🔒 The recruiter&apos;s budget, floor and target are not editable here — they never
+            leave the server, which is what keeps the scenario honest.
           </p>
 
-          {error && <p className="mt-2 text-sm text-red-300">{error}</p>}
+          {error && <p className="text-sm text-red-300">{error}</p>}
 
-          <div className="mt-4 flex justify-end gap-2">
+          <div className="flex justify-end gap-2 border-t border-white/10 pt-4">
             <button className="btn btn-ghost" onClick={() => setEditing(false)} disabled={busy}>
               Cancel
             </button>
@@ -295,10 +372,7 @@ function Modal({
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 py-10">
       <div
-        className={[
-          "card w-full space-y-3",
-          wide ? "max-w-2xl" : "max-w-md",
-        ].join(" ")}
+        className={["card w-full space-y-3", wide ? "max-w-2xl" : "max-w-md"].join(" ")}
       >
         <div className="flex items-center justify-between">
           <h3 className="font-semibold">{title}</h3>
@@ -329,5 +403,56 @@ function Field({
       <div className="mt-1">{children}</div>
       {hint && <span className="mt-1 block text-xs text-white/30">{hint}</span>}
     </label>
+  );
+}
+
+/** Numbered section wrapper for the edit form. */
+function EditSection({
+  step,
+  title,
+  hint,
+  children,
+}: {
+  step: string;
+  title: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+      <div className="mb-3 flex items-center gap-3">
+        <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-violet-500/25 text-xs font-bold text-violet-200">
+          {step}
+        </span>
+        <div className="min-w-0">
+          <h4 className="text-sm font-semibold">{title}</h4>
+          {hint && <p className="truncate text-xs text-white/35">{hint}</p>}
+        </div>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function MoneyStat({
+  label,
+  value,
+  accent,
+}: {
+  label: string;
+  value: number;
+  accent: string;
+}) {
+  return (
+    <>
+      <p className="text-[10px] font-semibold uppercase tracking-wide text-white/35">{label}</p>
+      <p className={["mt-0.5 text-sm font-semibold tabular-nums", accent].join(" ")}>
+        {value.toLocaleString("en-US", {
+          style: "currency",
+          currency: "USD",
+          maximumFractionDigits: 0,
+        })}
+      </p>
+    </>
   );
 }
