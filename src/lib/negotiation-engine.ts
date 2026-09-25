@@ -31,6 +31,8 @@ export interface UserMoveClassification {
   commitmentSignal: boolean;
   /** Signals walking away / rejecting. */
   walkAwaySignal: boolean;
+  /** Asks about a decision the recruiter previously deferred ("what did the team say?"). */
+  decisionRequest: boolean;
   /** Talked over the recruiter (server marks separately, mirrored here). */
   interruption: boolean;
 }
@@ -93,11 +95,19 @@ export function classifyUserMove(
   const walkAwaySignal =
     /walk away|walking away|not a fit|not the right fit|go(?:ing)? with (?:the )?other|accept the other|decline|turn(?:ing)? (?:you |this )?down|not going to (?:be able to|work)|can'?t accept|cannot accept|not interested|pass on (?:this|the) (?:role|offer)|withdraw/.test(t);
 
+  // "What did the team say?" — the candidate is chasing a decision the
+  // recruiter already promised. Must be answered, never deferred again.
+  const decisionRequest =
+    /what did (?:the|they|your|his|her) (?:team|leadership|committee|manager|board|vp|boss)\b|what(?:'s| is| was) the (?:decision|verdict|word|answer)\b|any (?:news|word|update|progress|feedback)\b|did (?:the|they|your) \w* ?(?:team|leadership|committee) (?:say|approve|get back|come back)|did you (?:hear|talk to|speak with|check)\b|come back with|following up\b|checking (?:back )?in\b|any luck\b/.test(
+      t,
+    );
+
   // Primary classification precedence.
   let primary: MoveType;
   if (walkAwaySignal) primary = "walk_away";
   else if (commitmentSignal && leverage.present) primary = "user_offer";
   else if (commitmentSignal) primary = "acceptance";
+  else if (decisionRequest) primary = "information_request";
   else if (reservationReveal) primary = "information_revealed";
   else if (leverage.present) primary = "leverage_introduced";
   else if (amounts.length > 0) primary = "user_offer";
@@ -112,6 +122,7 @@ export function classifyUserMove(
     informationRequest,
     commitmentSignal,
     walkAwaySignal,
+    decisionRequest,
     interruption: Boolean(opts.userInterrupted),
   };
 }
@@ -140,11 +151,17 @@ export interface EngineState {
   leverageActive: boolean;
   /** One best-and-final recovery is allowed per attempt. */
   hasRecovered: boolean;
+  /**
+   * True when the recruiter verbally deferred to an internal team. The next
+   * time the candidate asks what the team said, the engine MUST land a real
+   * decision instead of deferring again.
+   */
+  pendingDecision: boolean;
   round: number;
 }
 
 export type RecruiterMove =
-  | { kind: "hold_firm" }
+  | { kind: "hold_firm"; final?: boolean }
   | { kind: "challenge_leverage" }
   | { kind: "counter"; package: CompPackage; conditions: string[] }
   | { kind: "trade"; package: CompPackage; conditions: string[]; gave: string; wants: string }
@@ -243,6 +260,29 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
       package: counter,
       conditions: ["assuming you can share the offer in writing"],
     };
+  }
+
+  // 3b. The candidate is chasing a decision the recruiter already deferred.
+  //     A non-agent must never stall forever: if a decision is pending, land
+  //     one for real (approved move, or the standing package as the answer).
+  if (classification.decisionRequest) {
+    if (state.pendingDecision) {
+      state.pendingDecision = false;
+      const justified =
+        state.justificationScore >= 2 || state.leverageCredibility > 0.6;
+      if (justified) {
+        const gap = threshold - total(state.currentOffer);
+        const step = Math.max(3000, Math.round(gap * (maxConcessionShare(hidden, state) + 0.05)));
+        const targetTotal = Math.min(threshold, total(state.currentOffer) + step);
+        const counter = bestSplit(hidden, state, total(state.currentOffer), targetTotal);
+        if (total(counter) > total(state.currentOffer)) {
+          return { kind: "counter", package: counter, conditions: ["approved this morning"] };
+        }
+      }
+      // No approval available: the standing package IS the answer.
+      return { kind: "hold_firm", final: true };
+    }
+    return { kind: "probe", question: informationAnswerQuestion(hidden, state) };
   }
 
   // 4. Reservation reveal: recruiter never matches it — small move + probe.
@@ -393,6 +433,200 @@ function informationAnswerQuestion(hidden: HiddenState, state: EngineState): str
 }
 
 // ---------------------------------------------------------------------------
+// Spoken-offer extraction
+// ---------------------------------------------------------------------------
+//
+// The voice model is instructed to only speak engine-authorized numbers, but it
+// does not always comply — and when it improvises a package the candidate has
+// genuinely been offered it. The panel (and the report) must reflect what was
+// actually said, so recruiter speech is parsed here and reconciled against the
+// hard economics. This is the ONLY place a spoken number becomes authoritative,
+// and it can never exceed the company ceiling.
+
+export interface SpokenPackage {
+  base: number | null;
+  sign_on: number | null;
+  equity: number | null;
+  total: number | null;
+}
+
+/** "180,000" / "180" / "180k" / "180 thousand" → dollars (0 when not a comp figure). */
+function moneyOf(digits: string, suffix?: string): number {
+  const n = parseInt(digits.replace(/[,\s]/g, ""), 10);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  if (suffix) return n * 1000;
+  if (n >= 1000) return n; // "30,000" → 30000
+  if (n >= 40 && n <= 999) return n * 1000; // "180" → 180000
+  return 0;
+}
+
+const AMT = String.raw`([\d][\d,]*)\s*(k\b|thousand|grand)?`;
+
+function pickAmount(text: string, ...patterns: RegExp[]): number | null {
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (!m) continue;
+    const v = moneyOf(m[1], m[2]);
+    if (v > 0) return v;
+  }
+  return null;
+}
+
+/**
+ * Clauses that only *reference* money rather than offer it. "You asked for
+ * 230,000 base, but I can't do that" must never be read as a 230k offer, and
+ * "they're struggling to get to 250,000" is the recruiter's ceiling being
+ * described, not a package. Split on clause boundaries so the useful half of a
+ * sentence ("but I can do 160,000 base") still counts.
+ */
+const REJECT_CUE =
+  /\b(?:you (?:asked|wanted|said|mentioned)|you'?re asking|can'?t|cannot|won'?t|will not|not going to|unable to|not able to|above (?:our|the)|more than (?:we|our|that)|out of (?:band|range)|doesn'?t work|no way|struggling to|too (?:high|much))\b/;
+
+function offerClauses(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[.!?;:\n]+|\s(?:but|however|though|although)\s/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && !REJECT_CUE.test(s));
+}
+
+/** Pull base / sign-on / equity / total out of a recruiter utterance. */
+export function extractSpokenPackage(text: string): SpokenPackage {
+  const t = offerClauses(text).join(" . ");
+
+  const base = pickAmount(
+    t,
+    new RegExp(String.raw`${AMT}\s*(?:in\s+|of\s+|for\s+)?(?:annual\s+|yearly\s+)?(?:base(?:\s*salary)?|salary)\b`),
+    new RegExp(String.raw`(?:base(?:\s*salary)?|salary)\s*(?:of|is|at|around|to|would be)?\s*\$?\s?${AMT}`),
+  );
+  const equity = pickAmount(
+    t,
+    new RegExp(String.raw`${AMT}\s*(?:in\s+|of\s+|worth of\s+)?(?:annual(?:ized)?\s+)?(?:equity|stock|rsus?)\b`),
+    new RegExp(String.raw`(?:equity|stock|rsus?)\s*(?:of|is|at|worth)?\s*\$?\s?${AMT}`),
+  );
+  const signOn = pickAmount(
+    t,
+    new RegExp(String.raw`${AMT}\s*(?:in\s+|of\s+|as\s+a\s+|as\s+)?(?:sign(?:ing)?[- ]?on|signing bonus|sign[- ]on bonus)\b`),
+    new RegExp(String.raw`(?:sign(?:ing)?[- ]?on|signing bonus|sign[- ]on bonus)\s*(?:of|is|at|worth)?\s*\$?\s?${AMT}`),
+  );
+  const total = pickAmount(
+    t,
+    new RegExp(
+      String.raw`(?:total package of|total package|package of|total of|all[- ]in|overall package of|total comp(?:ensation)? of|package (?:is|would be))\s*\$?\s?${AMT}`,
+    ),
+  );
+
+  return { base, sign_on: signOn, equity, total };
+}
+
+export interface ReconciledOffer {
+  pkg: CompPackage;
+  previous: CompPackage;
+  changed: boolean;
+  /** True when the spoken figures had to be trimmed to the company ceiling. */
+  adjusted: boolean;
+}
+
+/**
+ * Fold a spoken package into the authoritative engine state.
+ *
+ * Monotonic (the recruiter never talks the package down), component-capped
+ * (base ≤ budget, sign-on/equity ≤ flex caps) and total-capped, so an
+ * improvising model can never hand out more than the company can pay.
+ */
+export function reconcileSpokenPackage(
+  hidden: HiddenState,
+  state: EngineState,
+  spoken: SpokenPackage,
+): ReconciledOffer | null {
+  const cur = state.currentOffer;
+  const hasComponent =
+    spoken.base != null || spoken.sign_on != null || spoken.equity != null;
+  if (!hasComponent && spoken.total == null) return null;
+
+  const capBase = hidden.budget;
+  const capSignOn = hidden.flex.sign_on_max ?? 0;
+  const capEquity = hidden.flex.equity_max ?? 0;
+  const capTotal = capBase + capSignOn + capEquity;
+
+  const finish = (pkg: CompPackage): ReconciledOffer | null => {
+    const normalized: CompPackage = {
+      base: roundTo(Math.max(0, pkg.base), 250),
+      sign_on: roundTo(Math.max(0, pkg.sign_on ?? 0), 250),
+      equity: roundTo(Math.max(0, pkg.equity ?? 0), 250),
+    };
+    if (total(normalized) <= total(cur)) return null;
+    const adjusted =
+      (spoken.base != null && spoken.base !== normalized.base) ||
+      (spoken.sign_on != null && spoken.sign_on !== normalized.sign_on) ||
+      (spoken.equity != null && spoken.equity !== normalized.equity) ||
+      (spoken.total != null && spoken.total !== total(cur));
+    return { pkg: normalized, previous: cur, changed: true, adjusted };
+  };
+
+  // Total-only wording ("a total package of 215,000"): let the engine's own
+  // splitter decide which lever carries the increase.
+  if (!hasComponent) {
+    const targetTotal = Math.max(total(cur), Math.min(spoken.total ?? 0, capTotal));
+    return finish(bestSplit(hidden, state, total(cur), targetTotal));
+  }
+
+  let nextBase = spokeOr(spoken.base, cur.base, capBase);
+  const nextSignOn = spokeOr(spoken.sign_on, cur.sign_on ?? 0, capSignOn);
+  let nextEquity = spokeOr(spoken.equity, cur.equity ?? 0, capEquity);
+
+  // Never blow past the overall envelope: trim equity first (hardest to justify),
+  // then sign-on, then base.
+  let over = nextBase + nextSignOn + nextEquity - capTotal;
+  if (over > 0) {
+    const cutEq = Math.min(over, Math.max(0, nextEquity - (cur.equity ?? 0)));
+    nextEquity -= cutEq;
+    over -= cutEq;
+  }
+  if (over > 0) {
+    const cutSo = Math.min(over, Math.max(0, nextSignOn - (cur.sign_on ?? 0)));
+    over -= cutSo;
+  }
+  if (over > 0) nextBase = Math.max(cur.base, nextBase - over);
+
+  return finish({ base: nextBase, sign_on: nextSignOn, equity: nextEquity });
+}
+
+function spokeOr(spoken: number | null, current: number, cap: number): number {
+  if (spoken == null) return current;
+  return Math.max(current, Math.min(spoken, cap));
+}
+
+// ---------------------------------------------------------------------------
+// Deferral detection
+// ---------------------------------------------------------------------------
+//
+// "I'll take this back to the team and be in touch" is realistic negotiation
+// behavior, but in a simulation with no off-screen time it stalls the product:
+// the recruiter can promise a decision that never arrives. When we hear it, the
+// UI nudges the candidate to press for the answer and the engine is told a real
+// decision is owed.
+
+const DEFERRAL_PATTERNS: RegExp[] = [
+  /\btake (?:this|it|that)[^.!?]{0,40}\bback\b/,
+  /\bback to (?:the|my|our) (?:team|leadership|committee|hiring committee|leadership team|board|manager)\b/,
+  /\bcheck with (?:the|my|our) (?:team|leadership|manager|committee|director|vp|board)\b/,
+  /\b(?:i'?ll|i will|let me|we'?ll|we will) (?:get|be) (?:back|in touch)\b/,
+  /\bget back to you\b|\bbe in touch\b|\bcircle back\b/,
+  /\bdefinitive answer\b|\bfinal answer (?:from|on)\b/,
+  /\brun (?:this|it|that) by\b|\bhuddle\b|\bfollow up with you\b/,
+  /\bsee (?:if|what) (?:we|i|they) can do\b/,
+];
+
+export function detectDeferral(text: string): boolean {
+  const t = text.toLowerCase();
+  return DEFERRAL_PATTERNS.some((re) => re.test(t));
+}
+
+export const NO_DEFERRAL_RULE =
+  "Do not promise to check with the team, take the number away for approval, or get back to them later — you are the decision-maker on this call.";
+
+// ---------------------------------------------------------------------------
 // Directive builder — what the voice LLM must obey this turn
 // ---------------------------------------------------------------------------
 
@@ -406,24 +640,59 @@ export interface TurnDirective {
   toolHint: { offer?: { base_salary: number; sign_on?: number; equity?: number; notes?: string } | { final_base: number; sign_on?: number; equity?: number }; accept?: boolean } | null;
 }
 
-export function buildDirective(move: RecruiterMove, hidden: HiddenState): TurnDirective {
+interface DirectiveOpts {
+  /** The package currently on the table — safe to restate, never to raise. */
+  standingOffer?: CompPackage | null;
+}
+
+/**
+ * Public entry point. Wraps the move-specific directive with rules that apply
+ * to every turn (no deferrals) and lets a hold-firm turn restate the standing
+ * package without moving it.
+ */
+export function buildDirective(
+  move: RecruiterMove,
+  hidden: HiddenState,
+  opts: DirectiveOpts = {},
+): TurnDirective {
+  const d = buildDirectiveInner(move, hidden, opts);
+  if (!d.mustNotSay.includes(NO_DEFERRAL_RULE)) d.mustNotSay.push(NO_DEFERRAL_RULE);
+  return d;
+}
+
+function buildDirectiveInner(
+  move: RecruiterMove,
+  hidden: HiddenState,
+  opts: DirectiveOpts,
+): TurnDirective {
   switch (move.kind) {
-    case "hold_firm":
+    case "hold_firm": {
+      const standing = opts.standingOffer ?? null;
       return {
-        verdict: "HOLD FIRM — do not move any number this turn.",
-        mustSay: [
-          "Reaffirm the current offer's value in character.",
-          "Ask the candidate to justify the ask or name their evidence.",
-        ],
+        verdict: move.final
+          ? "HOLD FIRM — the candidate asked what the team decided; give a definite answer."
+          : "HOLD FIRM — do not move any number this turn.",
+        mustSay: move.final
+          ? [
+              "Answer their question directly and concretely: the numbers you already stated are what the team approved, and that is the best you can do.",
+              "Sound settled, not apologetic.",
+            ]
+          : [
+              "Reaffirm the current offer's value in character.",
+              "Ask the candidate to justify the ask or name their evidence.",
+            ],
         mustNotSay: [
-          "Do not raise or restate any new number.",
+          "Do not raise the offer or invent any number beyond the standing package.",
           "Do not apologize for the offer.",
         ],
-        allowedNumbers: [],
-        askUserQuestion: probeQuestion({ round: 1 } as EngineState),
+        // The standing package may be restated (it is already on the table);
+        // nothing above it may be said.
+        allowedNumbers: standing ? allowedNumbersFor(standing) : [],
+        askUserQuestion: move.final ? null : probeQuestion({ round: 1 } as EngineState),
         conditions: [],
         toolHint: null,
       };
+    }
     case "challenge_leverage":
       return {
         verdict: "CHALLENGE the claimed leverage before reacting to it.",

@@ -141,8 +141,9 @@ export const POST = handle(
       await setAttemptOutcomeIfAccepted(id, move.package, []);
     }
 
-    // 6. Build and return the directive for the voice LLM.
-    const directive = buildDirective(move, hidden);
+    // 6. Build and return the directive for the voice LLM. The standing
+    //    package is passed so a hold-firm turn may restate it (never raise it).
+    const directive = buildDirective(move, hidden, { standingOffer: state.currentOffer });
     return Response.json({ directive, verdict: engineVerdict });
   },
 );

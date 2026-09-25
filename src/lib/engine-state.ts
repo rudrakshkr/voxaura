@@ -27,6 +27,7 @@ export function initialEngineState(hidden: HiddenState): EngineState {
     userAskedForInfo: false,
     leverageActive: false,
     hasRecovered: false,
+    pendingDecision: false,
     round: 0,
   };
 }
@@ -49,6 +50,7 @@ export function deserializeEngineState(raw: unknown): EngineState | null {
     userAskedForInfo: s.userAskedForInfo ?? false,
     leverageActive: s.leverageActive ?? false,
     hasRecovered: s.hasRecovered ?? false,
+    pendingDecision: s.pendingDecision ?? false,
     round: s.round ?? 0,
   };
 }

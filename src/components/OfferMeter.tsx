@@ -12,11 +12,14 @@ export function OfferMeter({
   acceptedOffer,
   conditions,
   previousOffer,
+  notice,
 }: {
   currentOffer: CompPackage | null;
   acceptedOffer: CompPackage | null;
   conditions: string[];
   previousOffer: CompPackage | null;
+  /** Explains a package the server had to trim to the approved band. */
+  notice?: string | null;
 }) {
   const pkg = acceptedOffer ?? currentOffer;
   const total =
@@ -76,6 +79,10 @@ export function OfferMeter({
             ))}
           </ul>
         </div>
+      )}
+
+      {notice && !acceptedOffer && (
+        <p className="mt-3 border-t border-white/10 pt-2 text-xs text-white/45">{notice}</p>
       )}
 
       {acceptedOffer && <p className="mt-3 text-sm text-emerald-300">Deal accepted.</p>}

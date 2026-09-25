@@ -5,6 +5,7 @@ import {
   getReport,
   toPublicScenario,
 } from "@/lib/db/queries";
+import { deserializeEngineState } from "@/lib/engine-state";
 import { hiddenOf } from "@/lib/negotiation";
 
 export const dynamic = "force-dynamic";
@@ -26,7 +27,19 @@ export const GET = handle(
     // conversation. It contains only the persona's name — no confidential
     // numbers — so it is safe to send to the browser.
     const hidden = attempt.effective_hidden ?? hiddenOf(scenario);
+    // The standing package: the opening offer before the call, whatever is on
+    // the table now after a reconnect. It is already known to the candidate
+    // (the recruiter said it aloud), and having it up front means the offer
+    // panel is populated from the first second instead of waiting for a tool
+    // call that may never come.
+    const engine = deserializeEngineState(attempt.engine_state);
+    const currentOffer = engine?.currentOffer ?? {
+      base: hidden.opening_anchor,
+      sign_on: 0,
+      equity: 0,
+    };
     return Response.json({
+      current_offer: currentOffer,
       attempt: {
         id: attempt.id,
         scenario_id: attempt.scenario_id,

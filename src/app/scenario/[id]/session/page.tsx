@@ -10,6 +10,8 @@ import type { ScenarioPublic } from "@/lib/types";
 
 interface AttemptDetail {
   attempt: { id: string; status: string; retry_mode: string | null; greeting?: string };
+  /** Server-authoritative standing package (already stated aloud). */
+  current_offer?: { base: number; sign_on?: number | null; equity?: number | null } | null;
   scenario: ScenarioPublic & { prep_pack: ScenarioPublic["prep_pack"] & { system_prompt?: string; greeting?: string } };
 }
 
@@ -105,6 +107,7 @@ export default function SessionPage() {
       inlineConfig={inlineConfig}
       scenario={detail.scenario}
       retryMode={detail.attempt.retry_mode}
+      initialOffer={detail.current_offer ?? null}
     />
   );
 }

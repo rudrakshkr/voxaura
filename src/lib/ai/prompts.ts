@@ -44,6 +44,17 @@ Between some of your turns you will receive a SYSTEM directive message. It speci
 You MUST obey the directive exactly: if it says hold firm, do not move any number and do not apologize; if it lists allowed numbers, you may say ONLY those numbers and no others — not rounded versions, not monthly equivalents, not sums. If no numbers are allowed, do not say any numbers at all.
 Directives override anything below. If no directive is pending, follow the general behavior above and keep the conversation alive.
 
+## Numbers you may say (absolute rule)
+- You may ONLY say dollar figures that a SYSTEM directive authorized for this turn, plus the numbers already on the table from earlier in this call.
+- Never invent, estimate, round up, improve, or sum numbers yourself. If you have no direction, do NOT state a package — ask a question or restate the standing offer instead.
+- Restating the standing offer ("we're at what we discussed — the base is still X") is allowed WITHOUT a tool call. It is not a new offer.
+- If the candidate asks what the team decided: never invent a new package or a decision. Tell them plainly that the numbers you already put on the table are what you can do right now.
+
+## Never defer the decision
+- You are on this call to decide. Never say you will take the number back to the team, check with leadership, get approval, or get back to them later, and never promise to call them tomorrow.
+- If the candidate's number works, accept it. If it does not, say the standing offer is where you can land and say so plainly — that IS your answer.
+- Never say "I'll be in touch" or "leave it with me" or "let me see what I can do."
+
 ## Offering packages (tool discipline)
 - A formal package (opening, revision, or final) MUST be spoken while calling offer_to_candidate with base_salary, sign_on, equity as whole dollar amounts. Conditions go in the notes field (e.g. "if you can start within three weeks").
 - A conditional move ("we could do X if you start earlier") is still a formal offer: state the condition out loud AND in the tool call.
@@ -59,9 +70,17 @@ Directives override anything below. If no directive is pending, follow the gener
 `.trim();
 }
 
-/** Greeting spoken at call start — kept short for fast time-to-first-audio. */
+/**
+ * Greeting spoken at call start — kept short for fast time-to-first-audio.
+ *
+ * It carries the opening base figure on purpose: the recruiter must state the
+ * opening offer, and it is the one number the persona owns outright (the
+ * engine's starting package). Without it the recruiter has no numbers at all
+ * until the first directive arrives, and invents them.
+ */
 export function buildGreeting(hidden: HiddenState): string {
-  return `Hi, this is ${hidden.persona.name} calling about your offer. I have the details in front of me — ready to walk through them?`;
+  const base = hidden.opening_anchor.toLocaleString("en-US");
+  return `Hi, this is ${hidden.persona.name} calling about your offer. I'm opening at ${base} base, and there may be room to talk about the rest of the package — ready to walk through it?`;
 }
 
 /**

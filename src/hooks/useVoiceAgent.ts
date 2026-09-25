@@ -113,8 +113,22 @@ export interface VoiceAgentState {
   justInterrupted: boolean;
   /** Authoritative package: set ONLY by server-validated offers/acceptances. */
   currentOffer: CompPackage | null;
+  /** The package before the latest change, used for the "vs. last offer" delta. */
+  previousOffer: CompPackage | null;
   acceptedOffer: CompPackage | null;
   offerConditions: string[];
+  /**
+   * Shown when the recruiter improvised a number beyond the approved band and
+   * the panel had to trim it — so a mismatch between what was said aloud and
+   * what the panel shows is explained rather than silently wrong.
+   */
+  offerNotice: string | null;
+  /**
+   * Set when the recruiter verbally deferred the decision to an off-screen
+   * team. Nothing happens off-screen in a simulation, so the candidate is
+   * prompted to press for the answer instead of waiting on a dead promise.
+   */
+  deferral: { quote: string } | null;
   elapsedSec: number;
   /**
    * Non-fatal call-health warning. A live-looking connection that transmits no
@@ -166,6 +180,8 @@ export function useVoiceAgent(args: {
   agentId: string | null;
   agentMode: "stored" | "inline";
   inlineConfig?: InlineAgentConfig | null;
+  /** Server-derived standing package, so the panel is never empty at call start. */
+  initialOffer?: CompPackage | null;
 }) {
   const [state, setState] = useState<VoiceAgentState>({
     status: "idle",
@@ -177,9 +193,12 @@ export function useVoiceAgent(args: {
     agentSpeaking: false,
     recruiterThinking: false,
     justInterrupted: false,
-    currentOffer: null,
+    currentOffer: args.initialOffer ?? null,
+    previousOffer: null,
     acceptedOffer: null,
     offerConditions: [],
+    offerNotice: null,
+    deferral: null,
     elapsedSec: 0,
     audioWarning: null,
     audioFlowing: false,
@@ -244,10 +263,26 @@ export function useVoiceAgent(args: {
   // stale closures.
   const stateRef = useRef(state);
   stateRef.current = state;
+  // Mirrors of state used by the WS handlers: the recruiter must not be
+  // interrupted mid-utterance by a directive, and the deferral banner should
+  // only re-render when its state actually changes.
+  const agentSpeakingRef = useRef(false);
+  const deferralRef = useRef(false);
 
   const patch = useCallback((p: Partial<VoiceAgentState>) => {
     if (p.status) statusRef.current = p.status;
+    if (p.agentSpeaking !== undefined) agentSpeakingRef.current = p.agentSpeaking;
     setState((s) => ({ ...s, ...p }));
+  }, []);
+
+  /** Promote a new authoritative package, keeping the previous one for deltas. */
+  const setOffer = useCallback((pkg: CompPackage, conditions?: string[] | null) => {
+    setState((s) => ({
+      ...s,
+      previousOffer: s.currentOffer,
+      currentOffer: pkg,
+      ...(conditions ? { offerConditions: conditions } : {}),
+    }));
   }, []);
 
   const queueEvent = useCallback((e: BatchedEvent) => {
@@ -275,6 +310,58 @@ export function useVoiceAgent(args: {
   }, []);
 
   // ---------------------------------------------------------------------------
+  // Spoken-offer reconciliation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Tell the server what the recruiter just said, and adopt the package it
+   * returns. The server owns the economics: it parses the utterance, trims any
+   * improvised numbers to the company ceiling and persists the result — so the
+   * panel, the engine and the final report all agree with the call the user
+   * actually heard. It also tells us when the recruiter stalled by promising to
+   * "check with the team".
+   */
+  const reconcileSpokenOffer = useCallback(
+    async (text: string, atMs: number | null) => {
+      try {
+        const res = await fetch(`/api/attempts/${argsRef.current.attemptId}/offer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ agent_text: text, at_ms: atMs }),
+        });
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          offer: CompPackage;
+          changed: boolean;
+          adjusted: boolean;
+          deferral?: { outstanding: boolean; deferredNow: boolean; quote: string | null };
+        };
+
+        if (data.changed && data.offer) {
+          setOffer(data.offer);
+          patch({
+            offerNotice: data.adjusted
+              ? "The recruiter's spoken figure was above the approved band — this is the package the company can actually confirm."
+              : null,
+          });
+        }
+
+        const outstanding = Boolean(data.deferral?.outstanding);
+        if (outstanding && !deferralRef.current) {
+          deferralRef.current = true;
+          patch({ deferral: { quote: data.deferral?.quote ?? "" } });
+        } else if (!outstanding && deferralRef.current) {
+          deferralRef.current = false;
+          patch({ deferral: null });
+        }
+      } catch {
+        // Non-fatal: a dropped reconcile must never break the live call.
+      }
+    },
+    [patch, setOffer],
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool execution (client-side tools)
   // ---------------------------------------------------------------------------
 
@@ -293,7 +380,8 @@ export function useVoiceAgent(args: {
           .split(/[.;]\s*/)
           .map((s) => s.trim())
           .filter((s) => s.length > 0);
-        patch({ currentOffer: offer, offerConditions: conditions });
+        setOffer(offer, conditions);
+        if (stateRef.current.offerNotice) patch({ offerNotice: null });
         queueEvent({
           type: "opponent_offer",
           actor: "opponent",
@@ -310,6 +398,7 @@ export function useVoiceAgent(args: {
           sign_on: num(args.sign_on),
           equity: num(args.equity),
         };
+        setOffer(offer);
         patch({ acceptedOffer: offer });
         queueEvent({
           type: "commitment_signal",
@@ -344,7 +433,7 @@ export function useVoiceAgent(args: {
 
       return JSON.stringify({ error: `Unknown tool ${name}` });
     },
-    [patch, queueEvent],
+    [patch, queueEvent, setOffer],
   );
 
   function elapsedMs(): number {
@@ -701,8 +790,19 @@ export function useVoiceAgent(args: {
               partialUser: null,
               transcript: [...s.transcript, turn],
             }));
-            // Queue for the engine; dispatched when the recruiter's reply ends.
             pendingTurnRef.current = { text: event.text, interrupted: false };
+            // Deliver the engine directive NOW instead of waiting for the
+            // recruiter's reply to finish. The reply is generated moments after
+            // this event, so the old ordering meant every directive arrived a
+            // turn late — the model was left to improvise its own numbers and
+            // concessions in between. If the recruiter is already mid-utterance
+            // (barge-in) we must not inject into it: that path keeps the
+            // reply.done fallback below.
+            if (!agentSpeakingRef.current && !turnInFlightRef.current) {
+              const pending = pendingTurnRef.current;
+              pendingTurnRef.current = null;
+              void dispatchTurn(pending.text, pending.interrupted);
+            }
             break;
           }
 
@@ -724,6 +824,9 @@ export function useVoiceAgent(args: {
               atMs: elapsedMs(),
             };
             setState((s) => ({ ...s, transcript: [...s.transcript, turn] }));
+            // What the recruiter says is authoritative for the offer panel, and
+            // a promise to "check with the team" needs surfacing.
+            void reconcileSpokenOffer(event.text, elapsedMs());
             if (event.interrupted) {
               patch({ justInterrupted: true });
               queueEvent({
@@ -812,11 +915,13 @@ export function useVoiceAgent(args: {
     },
     [
       clearSetupTimers,
+      dispatchTurn,
       flushPendingTools,
       maybeDispatchPendingTurn,
       patch,
       playback,
       queueEvent,
+      reconcileSpokenOffer,
       runTool,
       send,
       startMic,
@@ -842,7 +947,15 @@ export function useVoiceAgent(args: {
     audioStatsRef.current = { chunks: 0, sent: 0, lastSentAt: 0 };
     audioWarnRef.current = null;
     audioFlowRef.current = false;
-    patch({ status: "connecting", error: null, audioWarning: null, audioFlowing: false });
+    deferralRef.current = false;
+    patch({
+      status: "connecting",
+      error: null,
+      audioWarning: null,
+      audioFlowing: false,
+      deferral: null,
+      offerNotice: null,
+    });
     try {
       await connectInner(null);
     } catch (err) {
@@ -865,12 +978,15 @@ export function useVoiceAgent(args: {
     if (ws && ws.readyState === WebSocket.OPEN) {
       window.setTimeout(() => ws.close(), 500);
     }
+    deferralRef.current = false;
     patch({
       status: "ended",
       agentSpeaking: false,
       userSpeaking: false,
       audioFlowing: false,
       audioWarning: null,
+      deferral: null,
+      offerNotice: null,
     });
   }, [flushEvents, mic, patch, playback, send]);
 

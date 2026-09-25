@@ -16,7 +16,13 @@ import type { ScenarioPublic } from "@/lib/types";interface Props {
   inlineConfig?: { systemPrompt: string; greeting: string } | null;
   scenario: ScenarioPublic;
   retryMode: string | null;
+  /** Server-authoritative standing package, so the panel is never empty. */
+  initialOffer?: { base: number; sign_on?: number | null; equity?: number | null } | null;
 }
+
+/** The line the candidate should say when the recruiter stalls on a decision. */
+const DECISION_LINE = "What did the team say?";
+
 export function VoiceSession(props: Props) {
   const router = useRouter();
   const { state, connect, end, restart } = useVoiceAgent({
@@ -24,9 +30,11 @@ export function VoiceSession(props: Props) {
     agentId: props.agentId,
     agentMode: props.agentMode,
     inlineConfig: props.inlineConfig ?? null,
+    initialOffer: props.initialOffer ?? null,
   });
   const [completing, setCompleting] = useState(false);
   const [completeError, setCompleteError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
   const completingRef = useRef(false);
 
   const complete = useCallback(async () => {
@@ -142,6 +150,43 @@ export function VoiceSession(props: Props) {
         </div>
       )}
 
+      {/* Nothing happens off-screen in a simulation. When the recruiter promises
+          to "take it back to the team", say so plainly and hand the candidate
+          the line that forces a real decision. */}
+      {state.deferral && state.status === "ready" && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+          <p className="font-medium">The recruiter stalled on the decision</p>
+          <p className="mt-1 text-amber-100/80">
+            They said they&apos;d take your number away for approval. There is no off-screen team —
+            press for the answer before the call ends.
+          </p>
+          {state.deferral.quote && (
+            <p className="mt-2 border-l-2 border-amber-400/40 pl-3 text-xs italic text-amber-100/60">
+              “{state.deferral.quote}”
+            </p>
+          )}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="rounded-lg bg-white/10 px-3 py-1.5 font-mono text-xs text-amber-50">
+              “{DECISION_LINE}”
+            </span>
+            <button
+              className="btn btn-ghost"
+              onClick={() => {
+                void Promise.resolve(navigator.clipboard?.writeText(DECISION_LINE)).then(() => {
+                  setCopied(true);
+                  window.setTimeout(() => setCopied(false), 2000);
+                });
+              }}
+            >
+              {copied ? "Copied" : "Copy the line"}
+            </button>
+          </div>
+          <p className="mt-2 text-xs text-amber-100/60">
+            Say it out loud — the recruiter has to give you a straight answer this time.
+          </p>
+        </div>
+      )}
+
       <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
         <div className="space-y-4">
           <TranscriptView
@@ -156,7 +201,8 @@ export function VoiceSession(props: Props) {
             currentOffer={state.currentOffer}
             acceptedOffer={state.acceptedOffer}
             conditions={state.offerConditions}
-            previousOffer={null}
+            previousOffer={state.previousOffer}
+            notice={state.offerNotice}
           />
 
           <div className="card space-y-3">
