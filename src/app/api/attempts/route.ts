@@ -8,7 +8,7 @@ import { createAgent, deleteAgent } from "@/lib/assemblyai/agents";
 import { createAttempt, getScenario } from "@/lib/db/queries";
 import { env } from "@/lib/env";
 import { hiddenOf } from "@/lib/negotiation";
-import { Difficulty } from "@/lib/types";
+import { Difficulty, normalizeHidden } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -23,9 +23,11 @@ export const POST = handle(async (req: Request) => {
 
   const scenario = await getScenario(body.data.scenario_id);
   const base = hiddenOf(scenario);
-  const effectiveHidden = body.data.retry_mode
-    ? deriveVariant(base, { harder: body.data.retry_mode === "harder", reRoll: body.data.retry_mode === "reroll" })
-    : base;
+  const effectiveHidden = normalizeHidden(
+    body.data.retry_mode
+      ? deriveVariant(base, { harder: body.data.retry_mode === "harder", reRoll: body.data.retry_mode === "reroll" })
+      : base,
+  );
 
   const attempt = await createAttempt(scenario.id, {
     effectiveHidden,

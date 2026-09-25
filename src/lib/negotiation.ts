@@ -1,10 +1,10 @@
 import { ApiError } from "./api";
 import type { AttemptRow, ScenarioRow } from "./db/queries";
-import type { HiddenState } from "./types";
+import { normalizeHidden, type HiddenState } from "./types";
 
 /** Reconstruct the base hidden state from scenario columns. */
 export function hiddenOf(scenario: ScenarioRow): HiddenState {
-  return {
+  return normalizeHidden({
     budget: scenario.budget,
     reservation: scenario.reservation,
     target: scenario.target,
@@ -12,7 +12,7 @@ export function hiddenOf(scenario: ScenarioRow): HiddenState {
     hiring_urgency: scenario.hiring_urgency,
     flex: scenario.flex,
     persona: scenario.persona,
-  };
+  });
 }
 
 export interface HydratedAttempt {
@@ -30,7 +30,11 @@ export interface HydratedAttempt {
  */
 export function hydrateAttempt(attempt: AttemptRow, scenario: ScenarioRow): HydratedAttempt {
   const base = hiddenOf(scenario);
-  const effectiveHidden = attempt.effective_hidden ?? base;
+  // Attempt variants were persisted at creation; normalize repairs any that
+  // predate the fraction-vs-dollars fix.
+  const effectiveHidden = attempt.effective_hidden
+    ? normalizeHidden(attempt.effective_hidden)
+    : base;
   return {
     attempt,
     scenario,

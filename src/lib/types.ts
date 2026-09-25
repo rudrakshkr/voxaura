@@ -106,6 +106,26 @@ export const HiddenState = z.object({
 });
 export type HiddenState = z.infer<typeof HiddenState>;
 
+/**
+ * Repair degenerate flex caps written by earlier generator prompts: equity (and
+ * sign-on) maxima occasionally arrived as fractions/percents (0.05 meaning
+ * "5%") instead of annual dollars, which silently clamped every spoken equity
+ * figure to ~0 on the offer panel. A cap below $1,000/yr is not a plausible
+ * dollar amount, so it is read as a fraction of the opening base and converted
+ * to whole dollars. Idempotent; already-dollar caps pass through untouched.
+ */
+export function normalizeHidden(h: HiddenState): HiddenState {
+  const toDollars = (cap: number | null | undefined): number => {
+    const v = cap ?? 0;
+    if (v > 0 && v < 1000) return Math.round((v * h.opening_anchor) / 250) * 250;
+    return Math.round(v);
+  };
+  const equity = toDollars(h.flex.equity_max);
+  const signOn = toDollars(h.flex.sign_on_max);
+  if (equity === (h.flex.equity_max ?? 0) && signOn === (h.flex.sign_on_max ?? 0)) return h;
+  return { ...h, flex: { ...h.flex, equity_max: equity, sign_on_max: signOn } };
+}
+
 // ---------------------------------------------------------------------------
 // Visible prep pack (safe to ship to the browser)
 // ---------------------------------------------------------------------------

@@ -365,7 +365,9 @@ function bestSplit(
     equity: state.currentOffer.equity ?? 0,
   };
 
-  const baseHeadroom = hidden.budget - state.granted.base - (pkg.base - hidden.opening_anchor) - state.granted.base;
+  // Room left under the base ceiling: budget minus everything already granted
+  // beyond the opening anchor.
+  const baseHeadroom = hidden.budget - (pkg.base - hidden.opening_anchor) - state.granted.base;
   const baseRoom = Math.max(0, Math.min(baseHeadroom, remaining));
   const baseGive = Math.min(baseRoom, Math.round(remaining * 0.7));
   pkg.base = roundTo(pkg.base + baseGive, 250);

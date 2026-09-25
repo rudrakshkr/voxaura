@@ -43,6 +43,15 @@ const HiddenSchema = z
     message: "opening anchor must leave room to negotiate up",
   });
 
+/** All flex caps are annual US-dollar amounts — never fractions or percents. */
+function normalizeGeneratedFlex(h: HiddenState): HiddenState {
+  const fix = (v: number | null | undefined): number => {
+    const n = v ?? 0;
+    return n > 0 && n < 1000 ? Math.round((n * h.opening_anchor) / 250) * 250 : Math.round(n);
+  };
+  return { ...h, flex: { ...h.flex, sign_on_max: fix(h.flex.sign_on_max), equity_max: fix(h.flex.equity_max) } };
+}
+
 const PrepSchema = z.object({
   title: z.string(),
   context: z.string(),
@@ -295,7 +304,7 @@ export async function generateScenario(input: {
     : describeForm(input.form, input.difficulty);
   const { content: raw, provider } = await callJson({
     system:
-      "You design realistic US salary negotiation simulations (all amounts in USD per year). You invent plausible companies, roles, and compensation bands. Hidden numbers must be internally consistent: opening_anchor < reservation < target <= budget; your_target and your_reservation (the CANDIDATE's prep guidance) must overlap the company band plausibly — the candidate's target should be near or slightly above the company's target. Flex values must be consistent with the archetype (a startup gives equity, a consulting firm barely any). Prep pack must NOT leak the company's private numbers, but your_target/your_reservation are the candidate's own guidance and are expected.",
+      "You design realistic US salary negotiation simulations (all amounts in USD per year). You invent plausible companies, roles, and compensation bands. Hidden numbers must be internally consistent: opening_anchor < reservation < target <= budget; your_target and your_reservation (the CANDIDATE's prep guidance) must overlap the company band plausibly — the candidate's target should be near or slightly above the company's target. Flex values must be consistent with the archetype (a startup gives equity, a consulting firm barely any). ALL flex values (sign_on_max, equity_max) are whole-dollar annual USD amounts — equity_max 0.05 is invalid, 12000 is valid. Prep pack must NOT leak the company's private numbers, but your_target/your_reservation are the candidate's own guidance and are expected.",
     user: `Difficulty: ${input.difficulty}. Archetype direction: ${archetype}. Honor every constraint in the direction literally — the role, industry, company stage, recruiter personality, candidate leverage and the listed levers must all be real in the simulation you invent (a listed lever must have a non-zero flex range). Invent a complete simulation with a specific invented company name (not Nimbus Data or any generic placeholder), named recruiter persona, and internally consistent economics. Respond with JSON only.`,
     schemaName: "scenario",
     schema: {
@@ -326,8 +335,8 @@ export async function generateScenario(input: {
               additionalProperties: false,
               required: ["sign_on_max", "equity_max", "remote_days", "start_date_weeks", "extra_pto_days"],
               properties: {
-                sign_on_max: { type: "integer" },
-                equity_max: { type: "number" },
+            sign_on_max: { type: "integer", description: "Maximum extra sign-on bonus in annual USD (e.g. 12000) — never a fraction or percent" },
+            equity_max: { type: "number", description: "Maximum annual equity value in USD per year (e.g. 15000) — never a fraction or percent like 0.05" },
                 remote_days: { type: "integer" },
                 start_date_weeks: { type: "integer" },
                 extra_pto_days: { type: "integer" },
@@ -373,7 +382,7 @@ export async function generateScenario(input: {
     prep: PrepPack;
   };
 
-  const hidden = HiddenSchema.parse(parsed.hidden);
+  const hidden = normalizeGeneratedFlex(HiddenSchema.parse(parsed.hidden));
   const prepPack: PrepPack = PrepSchema.parse(parsed.prep);
 
   return { hidden, prepPack };

@@ -52,6 +52,12 @@ ${ground}
 - You challenge weak arguments ("the market pays more" → "which market, for which scope?") and acknowledge strong ones concretely.
 - You vary your sentence shapes. Never open two turns the same way. Do not repeat the same phrase twice in a call.
 
+## The opening package (the ONLY numbers that exist at call start)
+- The offer currently on the table is base ${hidden.opening_anchor.toLocaleString("en-US")} dollars, no sign-on bonus, no annual equity.
+- When the candidate asks about any component — base, sign-on, equity, stock — restate EXACTLY these facts. There is no equity or sign-on in the current offer; do not invent, estimate, or "recall" one.
+- If the candidate asks whether sign-on or equity exists: improvements to those components are possible as part of a negotiated package, but only when a SYSTEM directive authorizes them.
+- Every number you speak aloud is treated by the platform as a real offer component. A figure you say casually ("there's about 20,000 in equity") becomes the official package. Speak a component only when the directive or the opening facts above contain it.
+
 ## Your private information (NEVER reveal, confirm, deny, hint at, or write out any of these)
 - Your budget ceiling, walk-away floor, target landing number, and planned opening anchor are confidential company data.
 - If asked directly what your max is: deflect in character ("that's not something I can share — but tell me what you need and I'll see what I can do").
@@ -102,7 +108,10 @@ Directives override anything below. If no directive is pending, follow the gener
 export function buildGreeting(hidden: HiddenState, facts?: ScenarioFacts): string {
   const base = hidden.opening_anchor.toLocaleString("en-US");
   const from = facts ? ` from ${facts.company} about the ${facts.level} ${facts.role} offer` : " about your offer";
-  return `Hi, this is ${hidden.persona.name}${from}. I'm opening at ${base} base, and there may be room to talk about the rest of the package — ready to walk through it?`;
+  // States the full opening package so the model owns its first numbers
+  // instead of improvising components (an invented "20k equity" at hello
+  // becomes the official package the moment it is spoken).
+  return `Hi, this is ${hidden.persona.name}${from}. The opening offer is ${base} base — that's the package as it stands today, and I'm happy to walk through it. Ready?`;
 }
 
 /**

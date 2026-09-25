@@ -7,6 +7,7 @@ import {
 } from "@/lib/db/queries";
 import { deserializeEngineState } from "@/lib/engine-state";
 import { hiddenOf } from "@/lib/negotiation";
+import { normalizeHidden } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -26,7 +27,7 @@ export const GET = handle(
     // agent with an empty greeting and the recruiter never opened the
     // conversation. It contains only the persona's name — no confidential
     // numbers — so it is safe to send to the browser.
-    const hidden = attempt.effective_hidden ?? hiddenOf(scenario);
+    const hidden = normalizeHidden(attempt.effective_hidden ?? hiddenOf(scenario));
     // The standing package: the opening offer before the call, whatever is on
     // the table now after a reconnect. It is already known to the candidate
     // (the recruiter said it aloud), and having it up front means the offer
