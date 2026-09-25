@@ -83,6 +83,54 @@ function pickArchetype(difficulty: Difficulty, brief?: string): string {
   return ARCHETYPES[Math.min(idx, ARCHETYPES.length - 1)];
 }
 
+/**
+ * The scenario builder's inputs. Every field is optional: whatever the user
+ * leaves blank is left to the generator, so a two-field form still produces a
+ * complete simulation while a fully filled form is honored exactly.
+ */
+export interface ScenarioForm {
+  role?: string;
+  industry?: string;
+  seniority?: string;
+  stage?: string;
+  persona_style?: string;
+  leverage?: string;
+  /** Levers that must genuinely exist in the scenario (base, equity, sign-on…). */
+  levers?: string[];
+  notes?: string;
+}
+
+function filled(v: string | undefined | null): string | undefined {
+  const s = (v ?? "").trim();
+  if (!s || /^(any|none|no preference)$/i.test(s)) return undefined;
+  return s;
+}
+
+/** Turn the builder's fields into a concrete archetype direction for the model. */
+export function describeForm(form: ScenarioForm | undefined, difficulty: Difficulty): string {
+  if (!form) return pickArchetype(difficulty);
+  const role = filled(form.role);
+  const seniority = filled(form.seniority);
+  const industry = filled(form.industry);
+  const stage = filled(form.stage);
+  const style = filled(form.persona_style);
+  const leverage = filled(form.leverage);
+  const levers = (form.levers ?? []).map((l) => l.trim()).filter(Boolean).slice(0, 8);
+  const notes = filled(form.notes);
+
+  const bits: string[] = [];
+  if (role) bits.push(`${seniority ? `${seniority} ` : ""}${role} role`);
+  if (industry) bits.push(`industry: ${industry}`);
+  if (stage) bits.push(`company stage: ${stage}`);
+  if (levers.length > 0) bits.push(`levers that must genuinely exist: ${levers.join(", ")}`);
+  if (style) bits.push(`the recruiter's personality must be ${style}`);
+  if (leverage) bits.push(`the candidate already has this leverage: ${leverage}`);
+  if (notes) bits.push(`extra context: ${notes}`);
+
+  if (bits.length === 0) return pickArchetype(difficulty);
+  return bits.join("; ");
+}
+
 // ---------------------------------------------------------------------------
 // Deterministic debug fallback (AI_DEBUG=1) — varied by difficulty
 // ---------------------------------------------------------------------------
@@ -234,17 +282,21 @@ export async function generateScenario(input: {
   difficulty: Difficulty;
   /** Brief user steer, e.g. "nonprofit startup, first job out of bootcamp". */
   brief?: string;
+  /** Structured scenario-builder fields (preferred over a free-text brief). */
+  form?: ScenarioForm;
 }): Promise<GeneratedScenario> {
   if (env().AI_DEBUG) {
     const dbg = debugScenario(input.difficulty);
     return { hidden: dbg.hidden, prepPack: dbg.prep };
   }
 
-  const archetype = pickArchetype(input.difficulty, input.brief);
+  const archetype = input.brief
+    ? pickArchetype(input.difficulty, input.brief)
+    : describeForm(input.form, input.difficulty);
   const { content: raw, provider } = await callJson({
     system:
       "You design realistic US salary negotiation simulations (all amounts in USD per year). You invent plausible companies, roles, and compensation bands. Hidden numbers must be internally consistent: opening_anchor < reservation < target <= budget; your_target and your_reservation (the CANDIDATE's prep guidance) must overlap the company band plausibly — the candidate's target should be near or slightly above the company's target. Flex values must be consistent with the archetype (a startup gives equity, a consulting firm barely any). Prep pack must NOT leak the company's private numbers, but your_target/your_reservation are the candidate's own guidance and are expected.",
-    user: `Difficulty: ${input.difficulty}. Archetype direction: ${archetype}. Invent a complete simulation with a specific invented company name (not Nimbus Data or any generic placeholder), named recruiter persona, and internally consistent economics. Respond with JSON only.`,
+    user: `Difficulty: ${input.difficulty}. Archetype direction: ${archetype}. Honor every constraint in the direction literally — the role, industry, company stage, recruiter personality, candidate leverage and the listed levers must all be real in the simulation you invent (a listed lever must have a non-zero flex range). Invent a complete simulation with a specific invented company name (not Nimbus Data or any generic placeholder), named recruiter persona, and internally consistent economics. Respond with JSON only.`,
     schemaName: "scenario",
     schema: {
       type: "object",

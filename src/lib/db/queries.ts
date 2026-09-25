@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNotNull, max } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, max, sql } from "drizzle-orm";
 
 import { ApiError } from "../api";
 import type {
@@ -43,6 +43,19 @@ export async function listScenarios(): Promise<ScenarioPublic[]> {
   return rows.map(toPublicScenario);
 }
 
+/** Scenario list plus how many attempts each one has (for delete warnings). */
+export async function listScenariosWithCounts(): Promise<
+  Array<ScenarioPublic & { attempt_count: number }>
+> {
+  const rows = await db
+    .select({ scenario: scenarios, count: sql<number>`count(${attempts.id})::int` })
+    .from(scenarios)
+    .leftJoin(attempts, eq(attempts.scenario_id, scenarios.id))
+    .groupBy(scenarios.id)
+    .orderBy(desc(scenarios.created_at));
+  return rows.map((r) => ({ ...toPublicScenario(r.scenario), attempt_count: r.count ?? 0 }));
+}
+
 export async function getScenario(id: string): Promise<ScenarioRow> {
   const [row] = await db.select().from(scenarios).where(eq(scenarios.id, id)).limit(1);
   if (!row) throw new ApiError(404, "Scenario not found");
@@ -76,6 +89,48 @@ export async function insertScenario(values: {
     })
     .returning();
   return row;
+}
+
+/** Update the user-editable parts of a scenario (never the hidden economics). */
+export async function updateScenario(
+  id: string,
+  values: {
+    title?: string;
+    company?: string;
+    role?: string;
+    level?: string;
+    difficulty?: Difficulty;
+    prep_pack?: Partial<PrepPack>;
+  },
+): Promise<ScenarioRow> {
+  const current = await getScenario(id);
+  const [row] = await db
+    .update(scenarios)
+    .set({
+      ...(values.title !== undefined ? { title: values.title } : {}),
+      ...(values.company !== undefined ? { company: values.company } : {}),
+      ...(values.role !== undefined ? { role: values.role } : {}),
+      ...(values.level !== undefined ? { level: values.level } : {}),
+      ...(values.difficulty !== undefined ? { difficulty: values.difficulty } : {}),
+      ...(values.prep_pack !== undefined
+        ? { prep_pack: { ...(current.prep_pack as PrepPack), ...values.prep_pack } }
+        : {}),
+    })
+    .where(eq(scenarios.id, id))
+    .returning();
+  return row;
+}
+
+/** Delete a scenario; its attempts, events and reports cascade with it. */
+export async function deleteScenario(id: string): Promise<number> {
+  const rows = await db.delete(scenarios).where(eq(scenarios.id, id)).returning({ id: scenarios.id });
+  return rows.length;
+}
+
+/** How many attempts (and therefore reports) a scenario would take with it. */
+export async function countScenarioAttempts(id: string): Promise<number> {
+  const rows = await db.select({ id: attempts.id }).from(attempts).where(eq(attempts.scenario_id, id));
+  return rows.length;
 }
 
 export async function createAttempt(
