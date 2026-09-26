@@ -70,6 +70,21 @@ export function packageTotal(p: CompPackage | null | undefined): number {
   return p.base + (p.sign_on ?? 0) + (p.equity ?? 0);
 }
 
+/**
+ * Event and transcript timestamps are stored in a 4-byte Postgres integer
+ * column (call-elapsed milliseconds), so an epoch-millis value from a naive
+ * API caller would overflow on insert and 500 the request. Values beyond the
+ * integer range are clamped to the cap rather than rejected — the timeline
+ * only needs relative ordering, not absolute time.
+ */
+export const MAX_EVENT_AT_MS = 2_000_000_000;
+
+export function clampEventAtMs(atMs: number | null | undefined): number | null {
+  if (atMs == null) return null;
+  if (!Number.isFinite(atMs)) return null;
+  return Math.min(Math.max(0, Math.floor(atMs)), MAX_EVENT_AT_MS);
+}
+
 // ---------------------------------------------------------------------------
 // Hidden state (server-side only — never serialized to the client)
 // ---------------------------------------------------------------------------

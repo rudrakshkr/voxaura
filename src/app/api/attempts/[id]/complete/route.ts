@@ -13,7 +13,7 @@ import {
 } from "@/lib/db/queries";
 import { hydrateAttempt } from "@/lib/negotiation";
 import { dedupeTranscriptTurns } from "@/lib/negotiation-engine";
-import { Outcome } from "@/lib/types";
+import { clampEventAtMs, Outcome } from "@/lib/types";
 import type { TranscriptTurn } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -69,7 +69,7 @@ export const POST = handle(
       role: t.role,
       text: t.text,
       interrupted: t.interrupted,
-      atMs: t.at_ms ?? null,
+      atMs: clampEventAtMs(t.at_ms),
     }));
     if (transcript.length === 0 && attempt.session_id) {
       const timeline = await getSessionTimeline(attempt.session_id);

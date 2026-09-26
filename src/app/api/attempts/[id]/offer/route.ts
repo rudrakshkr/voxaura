@@ -15,7 +15,7 @@ import {
   reconcileSpokenPackage,
   type SpokenPackage,
 } from "@/lib/negotiation-engine";
-import type { CompPackage } from "@/lib/types";
+import { clampEventAtMs, type CompPackage } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -37,6 +37,9 @@ const BodySchema = z
       .nullish(),
     /** Conditions/notes attached to the offer, shown on the panel. */
     conditions: z.array(z.string().min(1).max(160)).max(3).nullish(),
+    // Call-elapsed milliseconds. Clamped server-side before insert — see
+    // clampEventAtMs — because a naive client sending Date.now() epoch-millis
+    // would overflow the 4-byte integer column.
     at_ms: z.number().int().min(0).nullish(),
   })
   .refine((b) => Boolean(b.agent_text) || Boolean(b.package), {
@@ -71,7 +74,7 @@ export const POST = handle(
     const state = deserializeEngineState(attempt.engine_state) ?? initialEngineState(hidden);
 
     const text = body.data.agent_text?.trim() ?? "";
-    const atMs = body.data.at_ms ?? null;
+    const atMs = clampEventAtMs(body.data.at_ms);
     const conditions = (body.data.conditions ?? [])
       .map((c) => c.trim())
       .filter((c) => c.length > 0)

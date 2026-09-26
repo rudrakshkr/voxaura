@@ -10,6 +10,7 @@ import type {
   PrepPack,
   ScenarioPublic,
 } from "../types";
+import { clampEventAtMs } from "../types";
 
 import { db } from "./client";
 import {
@@ -246,7 +247,7 @@ export async function insertEvents(
     actor: e.actor,
     source: e.source,
     payload: e.payload as Record<string, unknown>,
-    at_ms: e.at_ms ?? null,
+    at_ms: clampEventAtMs(e.at_ms),
   }));
   try {
     await db.insert(negotiationEvents).values(rows);
