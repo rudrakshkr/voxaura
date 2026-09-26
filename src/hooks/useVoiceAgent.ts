@@ -10,7 +10,7 @@ import {
   type VoiceAgentEvent,
 } from "@/lib/voice/protocol";
 import type { BatchedEvent, CompPackage, TranscriptTurn } from "@/lib/types";
-import type { TurnDirective } from "@/lib/negotiation-engine";
+import { transcriptSignature, type TurnDirective } from "@/lib/negotiation-engine";
 
 /**
  * Client-handled function tools for the AssemblyAI voice agent.
@@ -148,12 +148,21 @@ export interface InlineAgentConfig {
 /**
  * The `session.update` body for inline (non-stored) agents. One builder so the
  * initial handshake and a post-resume re-attach can never drift apart.
- * The greeting is skipped when re-attaching: it already played once.
+ *
+ * `greetingOverride: null` skips the greeting entirely (a resume already played
+ * it). `resumeNote` is appended to the system prompt: without it a reconnect
+ * re-sent the ORIGINAL prompt — whose "opening package" section still describes
+ * the un-negotiated offer — and the recruiter could go back to quoting numbers
+ * the call had already moved past.
  */
-function inlineSessionPayload(cfg: InlineAgentConfig, opts?: { includeGreeting?: boolean }) {
+function inlineSessionPayload(
+  cfg: InlineAgentConfig,
+  opts?: { greetingOverride?: string | null; resumeNote?: string },
+) {
+  const greeting = opts?.greetingOverride === undefined ? cfg.greeting : opts.greetingOverride;
   return {
-    system_prompt: cfg.systemPrompt,
-    ...(opts?.includeGreeting === false ? {} : { greeting: cfg.greeting }),
+    system_prompt: opts?.resumeNote ? `${cfg.systemPrompt}\n${opts.resumeNote}` : cfg.systemPrompt,
+    ...(greeting ? { greeting } : {}),
     output: { voice: "anna" },
     tools: OPPONENT_TOOLS,
     input: {
@@ -166,11 +175,48 @@ function inlineSessionPayload(cfg: InlineAgentConfig, opts?: { includeGreeting?:
   };
 }
 
+/** One sentence naming the package, used by the resume note and greeting. */
+function packagePhrase(pkg: CompPackage): string {
+  const extras = [
+    (pkg.sign_on ?? 0) > 0 ? `${(pkg.sign_on ?? 0).toLocaleString("en-US")} sign-on` : "",
+    (pkg.equity ?? 0) > 0 ? `${(pkg.equity ?? 0).toLocaleString("en-US")} in annual equity` : "",
+  ].filter(Boolean);
+  const base = `${pkg.base.toLocaleString("en-US")} base`;
+  return extras.length > 0 ? `${base}, ${extras.join(" and ")}` : base;
+}
+
+/**
+ * Context for a re-attach or a mid-call restart: the call is already underway,
+ * so the greeting and the prompt's opening facts are both wrong. Returns null
+ * for a genuinely fresh call.
+ */
+function resumeContext(offer: CompPackage | null, midCall: boolean) {
+  if (!midCall) return null;
+  const sentence = offer ? packagePhrase(offer) : null;
+  const note = [
+    "## RESUME NOTE (this call is already in progress)",
+    "- You have already spoken with this candidate on this call. Do not greet them again and do not restart the conversation.",
+    sentence
+      ? `- The package on the table right now is ${sentence}. That supersedes the opening package described above — never quote the opening numbers again.`
+      : "- No package has been stated yet on this call.",
+  ].join("\n");
+  return {
+    note,
+    greeting: sentence
+      ? `Sorry about that — I'm back. So, where we are: ${sentence}. Where were we?`
+      : "Sorry about that — I'm back. Where were we?",
+  };
+}
+
 const MAX_SESSION_SEC = 10 * 60; // client-side guard; server TTL gives no warning
 const MicBufferSamples = 4096; // ~170ms at 24 kHz per WS message
 const AUDIO_SILENCE_MS = 6000; // ready but no frames transmitted this long => warn
 const AUDIO_FLOWING_MS = 1500; // frames this recent count as "audio is flowing"
 const RESUME_GRACE_MS = 25_000; // server holds sessions for 30s after drop
+// The voice service occasionally finalises the same utterance twice. Identical
+// text from the same speaker inside this window is one turn, not two.
+const AGENT_DUPLICATE_MS = 45_000;
+const USER_DUPLICATE_MS = 3_000;
 const SETUP_TIMEOUT_MS = 15_000; // token + WS + session.ready must land within this
 const MIC_READY_TIMEOUT_MS = 10_000; // first-time mic permission can be slow, not infinite
 const GREETING_TIMEOUT_MS = 12_000; // ready but no recruiter audio => setup is wedged
@@ -238,6 +284,12 @@ export function useVoiceAgent(args: {
   const pendingTurnRef = useRef<{ text: string; interrupted: boolean } | null>(null);
   const turnInFlightRef = useRef(false);
 
+  // Duplicate-turn guards. A repeated finalisation used to print the recruiter's
+  // sentence twice AND get re-parsed as a fresh offer, which is how the panel
+  // ended up changing because of a duplicate rather than anything said.
+  const lastAgentTurnRef = useRef<{ sig: string; at: number } | null>(null);
+  const lastUserTurnRef = useRef<{ sig: string; at: number } | null>(null);
+
   const mic = useMicCapture();
   const playback = usePcmPlayback();
   const argsRef = useRef(args);
@@ -259,6 +311,9 @@ export function useVoiceAgent(args: {
   // True when the failure came from session setup (bad config / rejected
   // update) rather than the transport — lets onclose keep the better message.
   const setupFailRef = useRef(false);
+  // True when this session was configured to speak on connect, so "connected but
+  // silent" is a setup failure rather than a normal mid-call resume.
+  const expectSpeechRef = useRef(false);
   // Live mirror of state for reads inside timers/event handlers without
   // stale closures.
   const stateRef = useRef(state);
@@ -277,12 +332,22 @@ export function useVoiceAgent(args: {
 
   /** Promote a new authoritative package, keeping the previous one for deltas. */
   const setOffer = useCallback((pkg: CompPackage, conditions?: string[] | null) => {
-    setState((s) => ({
-      ...s,
-      previousOffer: s.currentOffer,
-      currentOffer: pkg,
-      ...(conditions ? { offerConditions: conditions } : {}),
-    }));
+    setState((s) => {
+      // Both the tool call and the spoken sentence reach the server, so the same
+      // package can arrive twice. Re-promoting an identical package must not
+      // manufacture a "vs. last offer" delta that never happened.
+      const unchanged =
+        s.currentOffer != null &&
+        s.currentOffer.base === pkg.base &&
+        (s.currentOffer.sign_on ?? 0) === (pkg.sign_on ?? 0) &&
+        (s.currentOffer.equity ?? 0) === (pkg.equity ?? 0);
+      return {
+        ...s,
+        previousOffer: unchanged ? s.previousOffer : s.currentOffer,
+        currentOffer: pkg,
+        ...(conditions ? { offerConditions: conditions } : {}),
+      };
+    });
   }, []);
 
   const queueEvent = useCallback((e: BatchedEvent) => {
@@ -321,29 +386,40 @@ export function useVoiceAgent(args: {
    * actually heard. It also tells us when the recruiter stalled by promising to
    * "check with the team".
    */
-  const reconcileSpokenOffer = useCallback(
-    async (text: string, atMs: number | null) => {
+  const reconcileOffer = useCallback(
+    async (
+      input: { agentText?: string; pkg?: CompPackage; conditions?: string[] | null },
+      atMs: number | null,
+    ) => {
       try {
         const res = await fetch(`/api/attempts/${argsRef.current.attemptId}/offer`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ agent_text: text, at_ms: atMs }),
+          body: JSON.stringify({
+            agent_text: input.agentText,
+            package: input.pkg,
+            conditions: input.conditions?.length ? input.conditions : undefined,
+            at_ms: atMs,
+          }),
         });
-        if (!res.ok) return;
+        if (!res.ok) return null;
         const data = (await res.json()) as {
           offer: CompPackage;
           changed: boolean;
           adjusted: boolean;
+          notice: string | null;
+          conditions: string[] | null;
           deferral?: { outstanding: boolean; deferredNow: boolean; quote: string | null };
         };
 
         if (data.changed && data.offer) {
-          setOffer(data.offer);
-          patch({
-            offerNotice: data.adjusted
-              ? "The recruiter's spoken figure was above the approved band — this is the package the company can actually confirm."
-              : null,
-          });
+          setOffer(data.offer, data.conditions?.length ? data.conditions : undefined);
+        }
+        // A figure the recruiter cannot honour is worth surfacing even when the
+        // panel does not move: the candidate heard it and deserves to know which
+        // number is real.
+        if (data.changed || data.adjusted) {
+          patch({ offerNotice: data.adjusted ? data.notice : null });
         }
 
         const outstanding = Boolean(data.deferral?.outstanding);
@@ -354,11 +430,19 @@ export function useVoiceAgent(args: {
           deferralRef.current = false;
           patch({ deferral: null });
         }
+        return data;
       } catch {
         // Non-fatal: a dropped reconcile must never break the live call.
+        return null;
       }
     },
     [patch, setOffer],
+  );
+
+  /** Speech path: the server parses the sentence and clamps the result. */
+  const reconcileSpokenOffer = useCallback(
+    (text: string, atMs: number | null) => reconcileOffer({ agentText: text }, atMs),
+    [reconcileOffer],
   );
 
   // ---------------------------------------------------------------------------
@@ -380,8 +464,22 @@ export function useVoiceAgent(args: {
           .split(/[.;]\s*/)
           .map((s) => s.trim())
           .filter((s) => s.length > 0);
-        setOffer(offer, conditions);
-        if (stateRef.current.offerNotice) patch({ offerNotice: null });
+        // The tool call is a *claim*, not authority. The server clamps it to the
+        // company's band before it reaches the panel; only if that call fails do
+        // we fall back to what the model asked for (and the speech reconcile
+        // will land a moment later anyway).
+        void reconcileOffer({ pkg: offer, conditions }, elapsedMs()).then((res) => {
+          if (!res) {
+            // Validation was unreachable. Show what the recruiter said (the
+            // candidate heard it) but say plainly that it is unconfirmed rather
+            // than presenting an unchecked number as the company's package.
+            setOffer(offer, conditions);
+            patch({
+              offerNotice:
+                "The company's approval check didn't respond — these are the numbers the recruiter just stated, not yet confirmed.",
+            });
+          }
+        });
         queueEvent({
           type: "opponent_offer",
           actor: "opponent",
@@ -398,8 +496,13 @@ export function useVoiceAgent(args: {
           sign_on: num(args.sign_on),
           equity: num(args.equity),
         };
-        setOffer(offer);
-        patch({ acceptedOffer: offer });
+        // Same rule as an offer: the accepted package is what the ENGINE can
+        // confirm, never a number the model invented on the way out of the call.
+        void reconcileOffer({ pkg: offer }, elapsedMs()).then((res) => {
+          const final = res?.offer ?? offer;
+          if (res?.changed) setOffer(final);
+          patch({ acceptedOffer: final });
+        });
         queueEvent({
           type: "commitment_signal",
           actor: "opponent",
@@ -433,7 +536,7 @@ export function useVoiceAgent(args: {
 
       return JSON.stringify({ error: `Unknown tool ${name}` });
     },
-    [patch, queueEvent, setOffer],
+    [patch, queueEvent, reconcileOffer, setOffer],
   );
 
   function elapsedMs(): number {
@@ -641,21 +744,33 @@ export function useVoiceAgent(args: {
         // a specific message rather than a deaf call.
         startMic();
 
+        // A reconnect mid-call must not re-send the opening package as if the
+        // negotiation had not happened, and a fresh start mid-call must not
+        // re-greet the candidate with the original numbers.
+        const midCall = Boolean(resumeSessionId) || stateRef.current.transcript.length > 0;
+        const ctx = resumeContext(stateRef.current.currentOffer, midCall);
+
         if (resumeSessionId) {
           send({ type: "session.resume", session_id: resumeSessionId });
           // Re-attach the agent config after resume (some servers drop it).
           if (a.agentMode === "stored" && a.agentId) {
             send({ type: "session.update", session: { agent_id: a.agentId, output: { voice: "anna" } } });
           } else if (a.agentMode === "inline" && a.inlineConfig) {
-            send({
-              type: "session.update",
-              session: inlineSessionPayload(a.inlineConfig, { includeGreeting: false }),
+            const payload = inlineSessionPayload(a.inlineConfig, {
+              greetingOverride: null,
+              resumeNote: ctx?.note,
             });
+            expectSpeechRef.current = false;
+            send({ type: "session.update", session: payload });
           }
         } else if (a.agentMode === "stored" && a.agentId) {
           send({ type: "session.update", session: { agent_id: a.agentId, output: { voice: "anna" } } });
         } else if (a.agentMode === "inline" && a.inlineConfig) {
-          send({ type: "session.update", session: inlineSessionPayload(a.inlineConfig) });
+          const payload = inlineSessionPayload(a.inlineConfig, {
+            ...(ctx ? { greetingOverride: ctx.greeting, resumeNote: ctx.note } : {}),
+          });
+          expectSpeechRef.current = Boolean(payload.greeting);
+          send({ type: "session.update", session: payload });
         } else {
           patch({ status: "error", error: "No agent configuration available" });
           ws.close();
@@ -755,10 +870,12 @@ export function useVoiceAgent(args: {
             // config, silent TTS failure), fail visibly instead of silence.
             greetingTimerRef.current = window.setTimeout(() => {
               if (statusRef.current !== "ready") return;
-              if (
-                !playback.hasReceivedAudio() &&
-                stateRef.current.transcript.length === 0
-              ) {
+              // On a resumed call the recruiter is meant to stay quiet until the
+              // candidate speaks, so silence is only a failure when a greeting
+              // was expected (or on a call that never produced a single turn).
+              const expectedSpeech =
+                expectSpeechRef.current || stateRef.current.transcript.length === 0;
+              if (expectedSpeech && !playback.hasReceivedAudio()) {
                 failSetup(
                   "The opponent connected but never spoke. This usually clears on retry — try starting the call again.",
                 );
@@ -783,6 +900,14 @@ export function useVoiceAgent(args: {
           }
 
           case "transcript.user": {
+            // The same utterance can be finalised twice, which would append a
+            // phantom turn AND run the engine a second time for one sentence.
+            const userSig = transcriptSignature(event.text);
+            const prevUser = lastUserTurnRef.current;
+            if (prevUser && prevUser.sig === userSig && Date.now() - prevUser.at < USER_DUPLICATE_MS) {
+              break;
+            }
+            lastUserTurnRef.current = { sig: userSig, at: Date.now() };
             const turn: TranscriptTurn = {
               role: "user",
               text: event.text,
@@ -821,6 +946,20 @@ export function useVoiceAgent(args: {
           }
 
           case "transcript.agent": {
+            // A duplicated finalisation is dropped here, before it can be shown
+            // twice or re-parsed as a fresh offer — that pair of effects is what
+            // made the recruiter look like it was repeating itself and changing
+            // numbers it had already given.
+            const agentSig = transcriptSignature(event.text);
+            const prevAgent = lastAgentTurnRef.current;
+            if (
+              prevAgent &&
+              prevAgent.sig === agentSig &&
+              Date.now() - prevAgent.at < AGENT_DUPLICATE_MS
+            ) {
+              break;
+            }
+            lastAgentTurnRef.current = { sig: agentSig, at: Date.now() };
             const turn: TranscriptTurn = {
               role: "agent",
               text: event.text,
