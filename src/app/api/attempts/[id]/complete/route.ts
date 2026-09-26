@@ -12,6 +12,7 @@ import {
   saveReport,
 } from "@/lib/db/queries";
 import { hydrateAttempt } from "@/lib/negotiation";
+import { dedupeTranscriptTurns } from "@/lib/negotiation-engine";
 import { Outcome } from "@/lib/types";
 import type { TranscriptTurn } from "@/lib/types";
 
@@ -83,6 +84,10 @@ export const POST = handle(
           .filter((t) => t.text.length > 0);
       }
     }
+    // The voice service occasionally finalises one utterance twice. Collapsing
+    // those here keeps the report from showing the recruiter repeating itself
+    // verbatim (and from scoring a duplicate turn as a real one).
+    transcript = dedupeTranscriptTurns(transcript);
 
     // 3. Score with full evidence (engine state + hidden economics).
     //    If every LLM provider is down (out of credits, outage), fall back to

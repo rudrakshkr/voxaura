@@ -136,14 +136,24 @@ export const POST = handle(
     const { setAttemptEngineState, setAttemptOutcomeIfAccepted } = await import(
       "@/lib/db/queries"
     );
+    // 6. A correction pledge is consumed by this turn's directive, so it is
+    //    cleared before the state is persisted.
+    const correctionNeeded = state.correctionPledged;
+    state.correctionPledged = false;
     await setAttemptEngineState(id, serializeEngineState(state));
     if (move.kind === "accept") {
       await setAttemptOutcomeIfAccepted(id, move.package, []);
     }
 
-    // 6. Build and return the directive for the voice LLM. The standing
-    //    package is passed so a hold-firm turn may restate it (never raise it).
-    const directive = buildDirective(move, hidden, { standingOffer: state.currentOffer });
+    // 7. Build and return the directive for the voice LLM. The standing package
+    //    and the turn number travel with it so a hold-firm turn may restate the
+    //    exact figures (never raise them), and the recruiter never asks the same
+    //    probing question twice.
+    const directive = buildDirective(move, hidden, {
+      standingOffer: state.currentOffer,
+      round: state.round,
+      correctionNeeded,
+    });
     return Response.json({ directive, verdict: engineVerdict });
   },
 );
