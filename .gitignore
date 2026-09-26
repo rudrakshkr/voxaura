@@ -30,3 +30,5 @@ next-env.d.ts
 
 # generated repo bundles (repomix)
 repomix-output.xml
+.vercel
+.env*

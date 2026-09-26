@@ -24,6 +24,7 @@
     "react": "19.1.1",
     "react-dom": "19.1.1",
     "tailwind-merge": "^3.3.1",
+    "vercel": "^59.16.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
