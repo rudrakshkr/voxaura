@@ -221,6 +221,31 @@ const RESUME_GRACE_MS = 25_000; // server holds sessions for 30s after drop
 // text from the same speaker inside this window is one turn, not two.
 const AGENT_DUPLICATE_MS = 45_000;
 const USER_DUPLICATE_MS = 3_000;
+/** Bound on one engine round-trip before we give up and (once) retry. */
+const TURN_FETCH_TIMEOUT_MS = 15_000;
+/** A reply that runs this long is treated as dead — see the watchdog sweeper. */
+const AGENT_SPEAKING_TIMEOUT_MS = 25_000;
+/** How often the watchdog sweeps the queue and a stuck agent state. */
+const TURN_WATCHDOG_MS = 1_500;
+/** Total engine attempts (across retries + watchdog re-queues) per utterance. */
+const MAX_TURN_ATTEMPTS = 4;
+
+/** Reject a promise if it has not settled within `ms`. */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = window.setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        window.clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        window.clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
 const SETUP_TIMEOUT_MS = 15_000; // token + WS + session.ready must land within this
 const MIC_READY_TIMEOUT_MS = 10_000; // first-time mic permission can be slow, not infinite
 const GREETING_TIMEOUT_MS = 12_000; // ready but no recruiter audio => setup is wedged
@@ -284,9 +309,17 @@ export function useVoiceAgent(args: {
   // Event batch queue for the attempts API.
   const eventQueueRef = useRef<BatchedEvent[]>([]);
 
-  // Turn relay: last user utterance queued until its agent reply completes.
-  const pendingTurnRef = useRef<{ text: string; interrupted: boolean } | null>(null);
+  // Turn relay: user utterances queue here until their engine directive has
+  // been dispatched. A QUEUE, never a slot — an utterance the engine has not
+  // seen must survive every later event (missed reply.done, hung fetch,
+  // barge-in) until it is dispatched. The old single slot was overwritten by
+  // each new utterance, so a wedged trigger meant the recruiter went deaf for
+  // whole turns: the user spoke two, three times and nothing happened.
+  const pendingTurnsRef = useRef<Array<{ text: string; interrupted: boolean; attempts: number }>>([]);
   const turnInFlightRef = useRef(false);
+  // When the current agent reply started — the watchdog reaps a reply that
+  // never ended (missing reply.done) instead of staying deaf forever.
+  const agentSpeakingAtRef = useRef(0);
 
   // Duplicate-turn guards. A repeated finalisation used to print the recruiter's
   // sentence twice AND get re-parsed as a fresh offer, which is how the panel
@@ -583,21 +616,75 @@ export function useVoiceAgent(args: {
   // Turn relay: user utterance → server engine → directive → agent
   // ---------------------------------------------------------------------------
 
+  // Stable indirection: event handlers and the watchdog call the pump through
+  // this ref, so ordering of useCallback definitions never matters and the
+  // callback identity churn of a big effect cannot strand the queue.
+  const pumpTurnQueueRef = useRef<() => void>(() => {});
+
+  /** Dispatch every queued turn, newest last; safe to call from anywhere. */
+  const pumpTurnQueue = useCallback(() => {
+    if (turnInFlightRef.current) return;
+    const queue = pendingTurnsRef.current;
+    if (queue.length === 0) return;
+    pendingTurnsRef.current = [];
+    // Collapse a rapid burst into its final utterance: the engine decides on
+    // the whole message, and answering each fragment would sound robotic.
+    const last = queue[queue.length - 1];
+    const merged = queue
+      .slice(0, -1)
+      .map((t) => t.text)
+      .join(" ");
+    const text = merged ? `${merged} ${last.text}` : last.text;
+    void dispatchTurnImplRef.current(text, last.interrupted).then((ok) => {
+      if (!ok) {
+        // Engine unreachable: put the utterance back for the watchdog to retry,
+        // until it has had MAX_TURN_ATTEMPTS tries in total.
+        const attempts = last.attempts + 1;
+        if (attempts < MAX_TURN_ATTEMPTS) {
+          pendingTurnsRef.current.unshift({ text, interrupted: last.interrupted, attempts });
+          pumpTurnQueueRef.current(); // retry immediately; the watchdog also sweeps
+        } else {
+          console.error("[voice] dropping utterance after repeated engine failures:", text.slice(0, 80));
+        }
+      }
+    });
+  }, []);
+
+  pumpTurnQueueRef.current = pumpTurnQueue;
+
   const dispatchTurn = useCallback(
     async (text: string, interrupted: boolean) => {
-      if (turnInFlightRef.current) return;
+      if (turnInFlightRef.current) return false;
       turnInFlightRef.current = true;
       patch({ recruiterThinking: true });
       try {
-        const res = await fetch(`/api/attempts/${argsRef.current.attemptId}/turn`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_text: text, user_interrupted: interrupted }),
-        });
-        if (!res.ok) return; // engine hiccup must never break the live call
-        const data = (await res.json()) as { directive: TurnDirective };
-        const d = data.directive;
-        if (!d) return;
+        let data: { directive: TurnDirective } | null = null;
+        // One retry: the relay must not die on a single dropped request — an
+        // unbounded, unretried fetch is how the recruiter used to go deaf for
+        // the rest of a call after one network blip.
+        for (let attempt = 0; attempt < 2 && !data; attempt++) {
+          try {
+            const res = await withTimeout(
+              fetch(`/api/attempts/${argsRef.current.attemptId}/turn`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ user_text: text, user_interrupted: interrupted }),
+              }),
+              TURN_FETCH_TIMEOUT_MS,
+            );
+            if (!res.ok) throw new Error(`turn ${res.status}`);
+            data = (await res.json()) as { directive: TurnDirective };
+          } catch (err) {
+            if (attempt === 1) {
+              console.error("[voice] engine turn failed after retry:", err);
+            }
+          }
+        }
+        const d = data?.directive;
+        if (!d) {
+          patch({ recruiterThinking: false }); // nothing is coming; unspin the UI
+          return false; // engine unreachable — the pump re-queues the utterance
+        }
 
         const lines: string[] = [`SYSTEM DIRECTIVE (obey exactly): ${d.verdict}`];
         // The on-table package travels with every directive: the model restates
@@ -626,20 +713,23 @@ export function useVoiceAgent(args: {
         }
 
         send({ type: "conversation.message", role: "system", content: lines.join("\n") });
+        return true;
       } finally {
         turnInFlightRef.current = false;
+        // Drain whatever queued up while this turn was in flight — the recruiter
+        // answers the latest thing the candidate said, and nothing is lost.
+        pumpTurnQueueRef.current();
       }
     },
     [patch, send],
   );
 
-  const maybeDispatchPendingTurn = useCallback(() => {
-    const pending = pendingTurnRef.current;
-    if (pending && !turnInFlightRef.current) {
-      pendingTurnRef.current = null;
-      void dispatchTurn(pending.text, pending.interrupted);
-    }
-  }, [dispatchTurn]);
+  // The pump dispatches through this ref so it can live above the dispatcher
+  // without a circular dependency between the two callbacks.
+  const dispatchTurnImplRef = useRef<(text: string, interrupted: boolean) => Promise<boolean>>(
+    async () => false,
+  );
+  dispatchTurnImplRef.current = dispatchTurn;
 
   const flushPendingTools = useCallback(() => {
     const pending = pendingToolsRef.current;
@@ -945,23 +1035,21 @@ export function useVoiceAgent(args: {
               partialUser: null,
               transcript: [...s.transcript, turn],
             }));
-            pendingTurnRef.current = { text: event.text, interrupted: false };
+            pendingTurnsRef.current.push({ text: event.text, interrupted: false, attempts: 0 });
             // Deliver the engine directive NOW instead of waiting for the
-            // recruiter's reply to finish. The reply is generated moments after
-            // this event, so the old ordering meant every directive arrived a
-            // turn late — the model was left to improvise its own numbers and
-            // concessions in between. If the recruiter is already mid-utterance
-            // (barge-in) we must not inject into it: that path keeps the
-            // reply.done fallback below.
-            if (!agentSpeakingRef.current && !turnInFlightRef.current) {
-              const pending = pendingTurnRef.current;
-              pendingTurnRef.current = null;
-              void dispatchTurn(pending.text, pending.interrupted);
+            // recruiter's reply to finish — the reply is generated moments after
+            // this event, so waiting meant every directive arrived a turn late.
+            // While the recruiter is mid-utterance (barge-in) the utterance stays
+            // queued: reply.done, dispatch completion, or the watchdog delivers
+            // it — one of them ALWAYS will, which is the point of the queue.
+            if (!agentSpeakingRef.current) {
+              pumpTurnQueueRef.current();
             }
             break;
           }
 
           case "reply.started": {
+            agentSpeakingAtRef.current = Date.now(); // watchdog baseline
             patch({ agentSpeaking: true, recruiterThinking: false });
             break;
           }
@@ -1010,15 +1098,17 @@ export function useVoiceAgent(args: {
           }
 
           case "reply.done": {
+            agentSpeakingAtRef.current = 0;
             patch({ agentSpeaking: false, recruiterThinking: false });
             if (event.status === "interrupted") {
               playback.flush();
               pendingToolsRef.current = []; // agent moved on; drop stale results
             } else {
               flushPendingTools();
-              // User's turn just completed → run the negotiation engine now.
-              maybeDispatchPendingTurn();
             }
+            // Whatever the user said while the recruiter spoke gets its turn
+            // now — and if a turn was somehow stuck, this unjams it.
+            pumpTurnQueueRef.current();
             break;
           }
 
@@ -1084,9 +1174,7 @@ export function useVoiceAgent(args: {
     },
     [
       clearSetupTimers,
-      dispatchTurn,
       flushPendingTools,
-      maybeDispatchPendingTurn,
       patch,
       playback,
       queueEvent,
@@ -1117,6 +1205,9 @@ export function useVoiceAgent(args: {
     audioWarnRef.current = null;
     audioFlowRef.current = false;
     deferralRef.current = false;
+    pendingTurnsRef.current = []; // a fresh call starts with a clean relay
+    agentSpeakingAtRef.current = 0;
+    turnInFlightRef.current = false;
     patch({
       status: "connecting",
       error: null,
@@ -1148,6 +1239,9 @@ export function useVoiceAgent(args: {
       window.setTimeout(() => ws.close(), 500);
     }
     deferralRef.current = false;
+    pendingTurnsRef.current = []; // nothing queued may survive the call
+    agentSpeakingAtRef.current = 0;
+    turnInFlightRef.current = false;
     patch({
       status: "ended",
       agentSpeaking: false,
@@ -1193,7 +1287,11 @@ export function useVoiceAgent(args: {
       agentSpeaking: false,
       userSpeaking: false,
       justInterrupted: false,
+      recruiterThinking: false,
     });
+    pendingTurnsRef.current = []; // restart = fresh relay
+    agentSpeakingAtRef.current = 0;
+    turnInFlightRef.current = false;
     window.setTimeout(() => {
       void connectInner(null)
         .catch((err) => {
@@ -1229,6 +1327,33 @@ export function useVoiceAgent(args: {
     const t = window.setInterval(() => void flushEvents(), 5000);
     return () => window.clearInterval(t);
   }, [state.status, flushEvents]);
+
+  /**
+   * Turn-relay watchdog.
+   *
+   * The old relay died silently whenever one expected event never arrived —
+   * a missed reply.done, a hung fetch — and the recruiter simply stopped
+   * responding for whole turns. This sweeper makes the system converge no
+   * matter what gets lost: every 1.5s it delivers any utterance the engine has
+   * not yet seen, and it reaps a reply that never ended (stuck
+   * agentSpeaking), so a lost websocket message costs one delayed turn instead
+   * of the rest of the call.
+   */
+  useEffect(() => {
+    if (state.status !== "ready") return;
+    const t = window.setInterval(() => {
+      pumpTurnQueueRef.current();
+      if (
+        agentSpeakingAtRef.current > 0 &&
+        Date.now() - agentSpeakingAtRef.current > AGENT_SPEAKING_TIMEOUT_MS
+      ) {
+        agentSpeakingAtRef.current = 0;
+        patch({ agentSpeaking: false, recruiterThinking: false });
+        pumpTurnQueueRef.current();
+      }
+    }, TURN_WATCHDOG_MS);
+    return () => window.clearInterval(t);
+  }, [state.status, patch]);
 
   // Clear the interrupted flag when the user speaks again.
   useEffect(() => {
