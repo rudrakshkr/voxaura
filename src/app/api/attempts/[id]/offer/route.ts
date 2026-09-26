@@ -25,8 +25,9 @@ const BodySchema = z
     /**
      * The structured arguments of an `offer_to_candidate` tool call. This path
      * exists because the tool call used to set the panel directly on the client,
-     * bypassing the engine entirely — so a hallucinated package could outlive the
-     * turn it was spoken in and never be trimmed back to the company's band.
+     * bypassing the engine entirely — so a hallucinated package could reach the
+     * panel without the engine state (and the next directive's FACT line)
+     * learning about it.
      */
     package: z
       .object({
@@ -54,10 +55,11 @@ const BodySchema = z
  * sometimes improvises a package — and once the candidate has HEARD those
  * numbers, the offer panel and the report must agree with the call. This route
  * parses the recruiter's utterance (or takes the tool-call package), folds it
- * into the server-side engine state (trimmed to the company ceiling, never
- * reduced), and returns the package the UI should display. A figure outside the
- * band also registers a correction pledge, so the recruiter says the right
- * number out loud on its next turn rather than silently contradicting itself.
+ * into the server-side engine state by MIRRORING it: the panel shows exactly
+ * what the recruiter said, the moment it said it. The engine state (and the next
+ * directive's FACT line) adopts the spoken package so every later turn quotes
+ * the same figures. A spoken figure beyond the approved band is not rewritten —
+ * it becomes a scoring signal in the final report.
  *
  * It also reports whether the recruiter deferred the decision to an off-screen
  * team, which the call screen surfaces so the candidate can press for a real
@@ -97,17 +99,17 @@ export const POST = handle(
 
     if (reconciled) {
       if (reconciled.changed) {
+        // The recruiter said a new package — that IS the package. It is mirrored
+        // verbatim onto the panel and folded into the engine state so the next
+        // directive's FACT line quotes the same figures. No clamping, no
+        // reshaping: a figure beyond the approved band is a scoring signal in
+        // the report, not a number the server silently rewrites.
         applyRecruiterPackage(state, hidden, reconciled.pkg);
         standing = reconciled.pkg;
       }
-      if (reconciled.adjusted) {
-        // The recruiter floated a figure it cannot honour. The next directive
-        // opens with a correction so the audio and the panel converge.
-        state.correctionPledged = true;
-      }
-      // A pure restatement of the standing package is not an event worth
-      // logging — only real changes and real misstatements are.
-      if (reconciled.changed || reconciled.adjusted) {
+      // Only a real change of package is worth logging — restating the same
+      // figures is not an event.
+      if (reconciled.changed) {
         events.push({
           type: "opponent_offer",
           actor: "opponent",
@@ -116,11 +118,7 @@ export const POST = handle(
             package: standing,
             spoken,
             impact: "neutral",
-            note: reconciled.changed
-              ? reconciled.adjusted
-                ? "recruiter's stated package, trimmed to the approved band"
-                : "recruiter stated a package on the call"
-              : "recruiter quoted a figure the company cannot confirm; package unchanged",
+            note: "recruiter stated a package on the call",
           },
           at_ms: atMs,
         });
@@ -145,7 +143,7 @@ export const POST = handle(
       });
     }
 
-    if (reconciled?.changed || reconciled?.adjusted || (deferred && !alreadyPending)) {
+    if (reconciled?.changed || (deferred && !alreadyPending)) {
       await setAttemptEngineState(id, serializeEngineState(state));
       if (events.length > 0) await insertEvents(id, events);
     }
@@ -153,11 +151,9 @@ export const POST = handle(
     return Response.json({
       offer: standing,
       changed: reconciled?.changed ?? false,
-      adjusted: reconciled?.adjusted ?? false,
+      adjusted: false,
       previous: reconciled?.changed ? reconciled.previous : null,
-      notice: reconciled?.adjusted
-        ? "The recruiter quoted figures that don't match the company's approved package — the package shown is the official one, and the recruiter will correct itself on its next turn."
-        : null,
+      notice: null,
       conditions: conditions.length > 0 ? conditions : null,
       deferral: {
         outstanding: state.pendingDecision,

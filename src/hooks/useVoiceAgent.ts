@@ -10,7 +10,11 @@ import {
   type VoiceAgentEvent,
 } from "@/lib/voice/protocol";
 import type { BatchedEvent, CompPackage, TranscriptTurn } from "@/lib/types";
-import { transcriptSignature, type TurnDirective } from "@/lib/negotiation-engine";
+import {
+  extractSpokenPackage,
+  transcriptSignature,
+  type TurnDirective,
+} from "@/lib/negotiation-engine";
 
 /**
  * Client-handled function tools for the AssemblyAI voice agent.
@@ -330,25 +334,39 @@ export function useVoiceAgent(args: {
     setState((s) => ({ ...s, ...p }));
   }, []);
 
-  /** Promote a new authoritative package, keeping the previous one for deltas. */
-  const setOffer = useCallback((pkg: CompPackage, conditions?: string[] | null) => {
-    setState((s) => {
-      // Both the tool call and the spoken sentence reach the server, so the same
-      // package can arrive twice. Re-promoting an identical package must not
-      // manufacture a "vs. last offer" delta that never happened.
-      const unchanged =
-        s.currentOffer != null &&
-        s.currentOffer.base === pkg.base &&
-        (s.currentOffer.sign_on ?? 0) === (pkg.sign_on ?? 0) &&
-        (s.currentOffer.equity ?? 0) === (pkg.equity ?? 0);
-      return {
-        ...s,
-        previousOffer: unchanged ? s.previousOffer : s.currentOffer,
-        currentOffer: pkg,
-        ...(conditions ? { offerConditions: conditions } : {}),
-      };
-    });
-  }, []);
+  /**
+   * Promote a new authoritative package, keeping the previous one for deltas.
+   * Accepts an updater for the optimistic speech path, where the panel must
+   * merge spoken components into whatever is already on the table.
+   */
+  const setOffer = useCallback(
+    (
+      pkg: CompPackage | ((prev: CompPackage) => CompPackage),
+      conditions?: string[] | null,
+    ) => {
+      setState((s) => {
+        const next =
+          typeof pkg === "function"
+            ? pkg(s.currentOffer ?? { base: 0, sign_on: 0, equity: 0 })
+            : pkg;
+        // Both the tool call and the spoken sentence reach the server, so the
+        // same package can arrive twice. Re-promoting an identical package must
+        // not manufacture a "vs. last offer" delta that never happened.
+        const unchanged =
+          s.currentOffer != null &&
+          s.currentOffer.base === next.base &&
+          (s.currentOffer.sign_on ?? 0) === (next.sign_on ?? 0) &&
+          (s.currentOffer.equity ?? 0) === (next.equity ?? 0);
+        return {
+          ...s,
+          previousOffer: unchanged ? s.previousOffer : s.currentOffer,
+          currentOffer: next,
+          ...(conditions ? { offerConditions: conditions } : {}),
+        };
+      });
+    },
+    [],
+  );
 
   const queueEvent = useCallback((e: BatchedEvent) => {
     eventQueueRef.current.push(e);
@@ -412,14 +430,11 @@ export function useVoiceAgent(args: {
           deferral?: { outstanding: boolean; deferredNow: boolean; quote: string | null };
         };
 
+        // The panel is already showing what the recruiter said (it was set the
+        // moment the words arrived); the server response only confirms what the
+        // engine state now holds, so later FACT lines quote the same figures.
         if (data.changed && data.offer) {
           setOffer(data.offer, data.conditions?.length ? data.conditions : undefined);
-        }
-        // A figure the recruiter cannot honour is worth surfacing even when the
-        // panel does not move: the candidate heard it and deserves to know which
-        // number is real.
-        if (data.changed || data.adjusted) {
-          patch({ offerNotice: data.adjusted ? data.notice : null });
         }
 
         const outstanding = Boolean(data.deferral?.outstanding);
@@ -439,10 +454,31 @@ export function useVoiceAgent(args: {
     [patch, setOffer],
   );
 
-  /** Speech path: the server parses the sentence and clamps the result. */
+  /**
+   * Speech path: put what the recruiter JUST SAID on the panel immediately —
+   * the screen must never lag the audio or disagree with it — then let the
+   * server mirror the same figures into the engine state so every later turn
+   * quotes them. The optimistic panel update is skipped when the sentence only
+   * names a total ("a package of 185,000"): splitting a total is the engine's
+   * job, and the server's response arrives a moment later with the split.
+   */
   const reconcileSpokenOffer = useCallback(
-    (text: string, atMs: number | null) => reconcileOffer({ agentText: text }, atMs),
-    [reconcileOffer],
+    (text: string, atMs: number | null) => {
+      const spoken = extractSpokenPackage(text);
+      const hasComponent = spoken.base != null || spoken.sign_on != null || spoken.equity != null;
+      if (hasComponent) {
+        setOffer(
+          (prev) => ({
+            base: spoken.base ?? prev.base,
+            sign_on: spoken.sign_on ?? (prev.sign_on ?? 0),
+            equity: spoken.equity ?? (prev.equity ?? 0),
+          }),
+          null,
+        );
+      }
+      return reconcileOffer({ agentText: text }, atMs);
+    },
+    [reconcileOffer, setOffer],
   );
 
   // ---------------------------------------------------------------------------
@@ -464,22 +500,13 @@ export function useVoiceAgent(args: {
           .split(/[.;]\s*/)
           .map((s) => s.trim())
           .filter((s) => s.length > 0);
-        // The tool call is a *claim*, not authority. The server clamps it to the
-        // company's band before it reaches the panel; only if that call fails do
-        // we fall back to what the model asked for (and the speech reconcile
-        // will land a moment later anyway).
-        void reconcileOffer({ pkg: offer, conditions }, elapsedMs()).then((res) => {
-          if (!res) {
-            // Validation was unreachable. Show what the recruiter said (the
-            // candidate heard it) but say plainly that it is unconfirmed rather
-            // than presenting an unchecked number as the company's package.
-            setOffer(offer, conditions);
-            patch({
-              offerNotice:
-                "The company's approval check didn't respond — these are the numbers the recruiter just stated, not yet confirmed.",
-            });
-          }
-        });
+        // The panel mirrors the recruiter instantly: the tool arguments ARE what
+        // the recruiter is putting on the table, so they go up on the board the
+        // moment the tool fires, before any network round-trip. The server call
+        // then mirrors the same figures into the engine state so the next
+        // directive's FACT line quotes them.
+        setOffer(offer, conditions);
+        void reconcileOffer({ pkg: offer, conditions }, elapsedMs());
         queueEvent({
           type: "opponent_offer",
           actor: "opponent",
@@ -496,12 +523,11 @@ export function useVoiceAgent(args: {
           sign_on: num(args.sign_on),
           equity: num(args.equity),
         };
-        // Same rule as an offer: the accepted package is what the ENGINE can
-        // confirm, never a number the model invented on the way out of the call.
+        // Same mirror rule: the accepted package is exactly what the recruiter
+        // accepted out loud — shown instantly, persisted by the server.
+        setOffer(offer);
         void reconcileOffer({ pkg: offer }, elapsedMs()).then((res) => {
-          const final = res?.offer ?? offer;
-          if (res?.changed) setOffer(final);
-          patch({ acceptedOffer: final });
+          patch({ acceptedOffer: res?.offer ?? offer });
         });
         queueEvent({
           type: "commitment_signal",

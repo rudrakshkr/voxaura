@@ -136,10 +136,6 @@ export const POST = handle(
     const { setAttemptEngineState, setAttemptOutcomeIfAccepted } = await import(
       "@/lib/db/queries"
     );
-    // 6. A correction pledge is consumed by this turn's directive, so it is
-    //    cleared before the state is persisted.
-    const correctionNeeded = state.correctionPledged;
-    state.correctionPledged = false;
     await setAttemptEngineState(id, serializeEngineState(state));
     if (move.kind === "accept") {
       await setAttemptOutcomeIfAccepted(id, move.package, []);
@@ -152,7 +148,6 @@ export const POST = handle(
     const directive = buildDirective(move, hidden, {
       standingOffer: state.currentOffer,
       round: state.round,
-      correctionNeeded,
     });
     return Response.json({ directive, verdict: engineVerdict });
   },

@@ -211,33 +211,45 @@ console.log("\nI. Asking for LESS than the standing package never raises the off
   check("labelled base ask did not move the package", state2.currentOffer.base === 150000);
 }
 
-console.log("\nJ. Spoken figures are clamped to the engine's own authority");
+console.log("\nJ. The panel mirrors exactly what the recruiter says");
 {
+  // The mirror doctrine: what the recruiter says IS the package. The server
+  // must not reshape, cap, floor or round spoken figures — the screenshot bug
+  // ("155,000 base and 25,000 equity" spoken, 157,250 / 7,250 / 7,000 shown)
+  // came from exactly that reshaping.
   const state = freshState();
-  const cap = maxOfferTotal(hidden);
-  const wild = reconcileSpokenPackage(hidden, state, { base: 200000, sign_on: 25000, equity: 30000, total: null });
-  check("an inflated package is capped, not adopted", wild != null && total(wild.pkg) <= cap + 250, `total=${wild ? total(wild.pkg) : "n/a"} cap=${cap}`);
-  check("an inflated package is flagged as adjusted", wild?.adjusted === true);
-  check("base never exceeds the budget", (wild?.pkg.base ?? 0) <= hidden.budget);
-  check("sign-on never exceeds its flex cap", (wild?.pkg.sign_on ?? 0) <= (hidden.flex.sign_on_max ?? 0));
-  check("equity never exceeds its flex cap", (wild?.pkg.equity ?? 0) <= (hidden.flex.equity_max ?? 0));
+  const spoken = reconcileSpokenPackage(hidden, state, { base: 155000, sign_on: 25000, equity: 25000, total: null });
+  if (spoken?.changed) applyRecruiterPackage(state, hidden, spoken.pkg); // the route's apply step
+  check("spoken components land verbatim on the panel", spoken?.pkg.base === 155000 && spoken?.pkg.sign_on === 25000 && spoken?.pkg.equity === 25000, JSON.stringify(spoken?.pkg));
+  check("mirroring is never flagged as adjusted", spoken?.adjusted === false);
+  check("a new spoken package counts as changed", spoken?.changed === true);
 
-  // An honest restatement changes nothing and is not flagged.
-  const state2 = freshState();
-  state2.currentOffer = { base: 152000, sign_on: 8000, equity: 4000 };
-  const same = reconcileSpokenPackage(hidden, state2, { base: 152000, sign_on: 8000, equity: 4000, total: null });
+  // Unspoken components keep their current values.
+  const partial = reconcileSpokenPackage(hidden, state, { base: 160000, sign_on: null, equity: null, total: null });
+  if (partial?.changed) applyRecruiterPackage(state, hidden, partial.pkg);
+  check("an unspoken component is preserved", partial?.pkg.base === 160000 && partial?.pkg.sign_on === 25000 && partial?.pkg.equity === 25000, JSON.stringify(partial?.pkg));
+
+  // A lower restatement is mirrored too — the recruiter may restate an earlier
+  // (lower) package, and the panel must show what was actually said.
+  const lower = reconcileSpokenPackage(hidden, state, { base: 150000, sign_on: 25000, equity: 25000, total: null });
+  if (lower?.changed) applyRecruiterPackage(state, hidden, lower.pkg);
+  check("a lower restatement is mirrored, not floored", lower?.pkg.base === 150000, `base=${lower?.pkg.base}`);
+
+  // A truthful restatement of the standing package changes nothing.
+  const same = reconcileSpokenPackage(hidden, state, { base: 150000, sign_on: 25000, equity: 25000, total: null });
   check("a truthful restatement is a no-op", same?.changed === false && same?.adjusted === false);
 
-  // A *lower* restatement must never talk the package down, but must be flagged
-  // so the call screen can explain the gap to the candidate.
-  const lower = reconcileSpokenPackage(hidden, state2, { base: 140000, sign_on: 8000, equity: 4000, total: null });
-  check("a lower restatement never lowers the panel", lower?.pkg.base === 152000 && lower?.changed === false);
-  check("a lower restatement is flagged", lower?.adjusted === true);
-
-  // Total-only wording is split by the engine, capped by the engine.
-  const totalOnly = reconcileSpokenPackage(hidden, freshState(), { base: null, sign_on: null, equity: null, total: 260000 });
-  check("a total-only claim is capped", totalOnly != null && total(totalOnly.pkg) <= cap + 250, `total=${totalOnly ? total(totalOnly.pkg) : "n/a"}`);
-  check("a capped total claim is flagged", totalOnly?.adjusted === true);
+  // Total-only wording: the package is rescaled so the panel total equals the
+  // spoken total exactly.
+  const from = { base: 150000, sign_on: 5000, equity: 5000 };
+  const state3 = freshState();
+  state3.currentOffer = from;
+  const up = reconcileSpokenPackage(hidden, state3, { base: null, sign_on: null, equity: null, total: 180000 });
+  check("a total-only claim is mirrored exactly (up)", up != null && total(up.pkg) === 180000, `total=${up ? total(up.pkg) : "n/a"}`);
+  check("upward rescale keeps components proportioned", up != null && up.pkg.base > 150000 && (up.pkg.sign_on ?? 0) >= 5000 && (up.pkg.equity ?? 0) >= 5000, JSON.stringify(up?.pkg));
+  const down = reconcileSpokenPackage(hidden, state3, { base: null, sign_on: null, equity: null, total: 120000 });
+  check("a total-only claim is mirrored exactly (down)", down != null && total(down.pkg) === 120000, `total=${down ? total(down.pkg) : "n/a"}`);
+  check("downward rescale keeps every component positive", down != null && down.pkg.base > 0, JSON.stringify(down?.pkg));
 
   // The parser itself: the exact sentence from the reported bug.
   const parsed = extractSpokenPackage(

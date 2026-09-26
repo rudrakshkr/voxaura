@@ -36,7 +36,6 @@ export function initialEngineState(hidden: HiddenState): EngineState {
     acceptAttempts: 0,
     evidenceTags: [],
     newEvidenceThisTurn: false,
-    correctionPledged: false,
   };
 }
 
@@ -67,7 +66,6 @@ export function deserializeEngineState(raw: unknown): EngineState | null {
     acceptAttempts: s.acceptAttempts ?? 0,
     evidenceTags: Array.isArray(s.evidenceTags) ? s.evidenceTags : [],
     newEvidenceThisTurn: s.newEvidenceThisTurn ?? false,
-    correctionPledged: s.correctionPledged ?? false,
   };
 }
 

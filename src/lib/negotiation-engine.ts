@@ -196,12 +196,6 @@ export interface EngineState {
   evidenceTags: string[];
   /** True when the candidate's current turn introduced genuinely new evidence. */
   newEvidenceThisTurn: boolean;
-  /**
-   * Set when the recruiter quoted a figure beyond its authority and the panel
-   * had to trim it. The next turn carries an explicit correction so the call
-   * and the screen cannot end up telling two different stories.
-   */
-  correctionPledged: boolean;
 }
 
 export type RecruiterMove =
@@ -743,22 +737,30 @@ export interface ReconciledOffer {
   previous: CompPackage;
   changed: boolean;
   /**
-   * True when the spoken figures could NOT be honoured as stated — above a flex
-   * cap, below the standing package, or past the company envelope. The panel
-   * keeps the authoritative package and the UI explains the gap out loud.
+   * Always false in the current mirror doctrine — the panel shows exactly what
+   * the recruiter said, so there is no server-side adjustment to report.
+   * Retained for API compatibility with clients that still read it.
    */
   adjusted: boolean;
 }
 
 /**
  * Fold a spoken package — or the arguments of an `offer_to_candidate` tool call
- * — into the authoritative engine state.
+ * — into the engine state by MIRRORING it: the panel shows exactly what the
+ * recruiter said, the moment it said it, with no server-side reshaping.
  *
- * Monotonic (the recruiter never talks the package down), component-capped
- * (base ≤ budget, sign-on/equity ≤ flex caps) and total-capped to the engine's
- * own maximum, so an improvising model can never hand out more than the
- * deterministic strategy would, and the panel, the directive and the final
- * report can never tell three different stories.
+ * Reshaping is what broke the candidate's trust before: the recruiter said
+ * "155,000 base and 25,000 in annual equity" while the panel displayed the
+ * engine's clamped 157,250 / 7,250 / 7,000 — three numbers nobody ever spoke.
+ * The recruiter is the single source of truth for what is on the table; the
+ * economics engine still governs every number the recruiter is ALLOWED to say
+ * via its directives and tool hints (and engine moves still cannot exceed the
+ * budget). A hallucinated figure now becomes a scoring signal, not a panel
+ * rewrite: the candidate sees the lie and the final report judges it.
+ *
+ * The one exception is total-only wording ("a total package of 185,000"): no
+ * component was spoken, so the current package is rescaled proportionally to
+ * that total and the spoken figure is then authoritative on the panel.
  */
 export function reconcileSpokenPackage(
   hidden: HiddenState,
@@ -769,60 +771,51 @@ export function reconcileSpokenPackage(
   const hasComponent = spoken.base != null || spoken.sign_on != null || spoken.equity != null;
   if (!hasComponent && spoken.total == null) return null;
 
-  const capTotal = maxOfferTotal(hidden);
-
-  const normalizePkg = (p: CompPackage): CompPackage => ({
-    base: roundTo(Math.max(0, p.base), 250),
-    sign_on: roundTo(Math.max(0, p.sign_on ?? 0), 250),
-    equity: roundTo(Math.max(0, p.equity ?? 0), 250),
-  });
-
   if (!hasComponent) {
-    // Total-only wording ("a total package of 185,000"): let the engine's own
-    // splitter decide which lever carries the increase.
-    const want = Math.max(total(cur), Math.min(spoken.total ?? 0, capTotal));
-    const pkg = normalizePkg(bestSplit(hidden, state, total(cur), want));
-    const changed = total(pkg) > total(cur);
-    return {
-      pkg: changed ? pkg : cur,
-      previous: cur,
-      changed,
-      adjusted: (spoken.total ?? 0) !== total(pkg),
-    };
+    // Total-only wording: no component was spoken, so the package is rescaled
+    // proportionally to mirror the spoken total exactly — the panel total then
+    // equals the figure the recruiter said, whatever the engine's own caps are.
+    const want = Math.max(0, spoken.total ?? 0);
+    if (want === total(cur)) return { pkg: cur, previous: cur, changed: false, adjusted: false };
+    const pkg = rescaleToTotal(cur, want);
+    return { pkg, previous: cur, changed: true, adjusted: false };
   }
 
-  let nextBase = spokeOr(spoken.base, cur.base, hidden.budget);
-  let nextSignOn = spokeOr(spoken.sign_on, cur.sign_on ?? 0, hidden.flex.sign_on_max ?? 0);
-  let nextEquity = spokeOr(spoken.equity, cur.equity ?? 0, hidden.flex.equity_max ?? 0);
-
-  // Never blow past the overall envelope: trim equity first (hardest to
-  // justify), then sign-on, then base. (The sign-on trim used to be computed
-  // and then never applied, so the envelope silently didn't bind at all.)
-  let over = nextBase + nextSignOn + nextEquity - capTotal;
-  if (over > 0) {
-    const cutEq = Math.min(over, Math.max(0, nextEquity - (cur.equity ?? 0)));
-    nextEquity -= cutEq;
-    over -= cutEq;
-  }
-  if (over > 0) {
-    const cutSo = Math.min(over, Math.max(0, nextSignOn - (cur.sign_on ?? 0)));
-    nextSignOn -= cutSo;
-    over -= cutSo;
-  }
-  if (over > 0) nextBase = Math.max(cur.base, nextBase - over);
-
-  const pkg = normalizePkg({ base: nextBase, sign_on: nextSignOn, equity: nextEquity });
-  const adjusted =
-    (spoken.base != null && spoken.base !== pkg.base) ||
-    (spoken.sign_on != null && spoken.sign_on !== pkg.sign_on) ||
-    (spoken.equity != null && spoken.equity !== pkg.equity);
-  const changed = total(pkg) > total(cur);
-  return { pkg: changed ? pkg : cur, previous: cur, changed, adjusted };
+  // Component wording: every spoken component replaces the panel value; every
+  // unspoken component keeps its current value.
+  const pkg: CompPackage = {
+    base: spoken.base ?? cur.base,
+    sign_on: spoken.sign_on ?? (cur.sign_on ?? 0),
+    equity: spoken.equity ?? (cur.equity ?? 0),
+  };
+  const changed = total(pkg) !== total(cur);
+  return { pkg, previous: cur, changed, adjusted: false };
 }
 
-function spokeOr(spoken: number | null, current: number, cap: number): number {
-  if (spoken == null) return current;
-  return Math.max(current, Math.min(spoken, cap));
+/**
+ * Rescale a package to an exact spoken total: scale every component
+ * proportionally, then absorb the rounding remainder in the largest component
+ * so the panel total equals the spoken total to the dollar.
+ */
+function rescaleToTotal(cur: CompPackage, want: number): CompPackage {
+  const from = total(cur);
+  if (from <= 0 || want <= 0) return { base: 0, sign_on: 0, equity: 0 };
+  const f = want / from;
+  const scale = (v: number | null | undefined) => Math.max(0, Math.round((v ?? 0) * f));
+  const pkg: CompPackage = {
+    base: scale(cur.base),
+    sign_on: scale(cur.sign_on),
+    equity: scale(cur.equity),
+  };
+  const drift = want - total(pkg);
+  if (drift !== 0) {
+    const signOn = pkg.sign_on ?? 0;
+    const equity = pkg.equity ?? 0;
+    if (pkg.base >= Math.max(signOn, equity)) pkg.base = Math.max(0, pkg.base + drift);
+    else if (signOn >= equity) pkg.sign_on = Math.max(0, signOn + drift);
+    else pkg.equity = Math.max(0, equity + drift);
+  }
+  return pkg;
 }
 
 // ---------------------------------------------------------------------------
@@ -935,8 +928,6 @@ interface DirectiveOpts {
   standingOffer?: CompPackage | null;
   /** Turn number after `advanceRound` — used to rotate probe questions. */
   round?: number;
-  /** The recruiter quoted a figure beyond its authority; it owes a correction. */
-  correctionNeeded?: boolean;
 }
 
 /** Rules that bind every turn, whatever the move. */
@@ -988,22 +979,6 @@ export function buildDirective(
   d.standingOfferLine = standing
     ? `FACT — the package currently on the table is base ${standing.base.toLocaleString("en-US")} dollars${(standing.sign_on ?? 0) > 0 ? `, sign-on ${(standing.sign_on ?? 0).toLocaleString("en-US")} dollars` : ""}${(standing.equity ?? 0) > 0 ? `, annual equity ${(standing.equity ?? 0).toLocaleString("en-US")} dollars` : ""} — a first-year total of ${total(standing).toLocaleString("en-US")} dollars. If the candidate asks about current numbers, these (and only these) are correct; any other figures you remember from earlier are outdated and must not be repeated or summed.`
     : null;
-  if (opts.correctionNeeded) {
-    // The recruiter floated a number it cannot honour and the panel had to trim
-    // it. Saying so once, out loud, is the only way the call and the screen stop
-    // telling two different stories.
-    d.verdict = `CORRECT THE RECORD, then continue — ${d.verdict}`;
-    d.mustSay.unshift(
-      standing
-        ? `Open by correcting the figure you floated: what you can actually approve is ${packageSentence(standing)} Then continue with the instruction.`
-        : "Open by correcting the number you floated earlier, then continue with the instruction.",
-    );
-    if (standing) {
-      for (const n of allowedNumbersFor(standing)) {
-        if (!d.allowedNumbers.includes(n)) d.allowedNumbers.push(n);
-      }
-    }
-  }
   return d;
 }
 
