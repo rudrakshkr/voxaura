@@ -245,8 +245,18 @@ const AGENT_SPEAKING_TIMEOUT_MS = 25_000;
 const TURN_WATCHDOG_MS = 1_500;
 /** Total engine attempts (across retries + watchdog re-queues) per utterance. */
 const MAX_TURN_ATTEMPTS = 4;
-/** Let the recruiter's closing line finish playing before we hang up. */
-const CLOSE_TAIL_MS = 2500;
+/**
+ * How long the line must stay COMPLETELY quiet — no reply in flight, no audio
+ * left to play — before we hang up.
+ *
+ * Measured from real silence, never from a guessed duration. Any delay picked
+ * in advance is a delay that can be shorter than the recruiter's sentence.
+ */
+const CLOSE_QUIET_MS = 4000;
+/** How often the close waiter re-checks whether the recruiter is still talking. */
+const CLOSE_POLL_MS = 250;
+/** Absolute ceiling on waiting, so a wedged reply can never strand the call. */
+const CLOSE_MAX_WAIT_MS = 20_000;
 
 /** Reject a promise if it has not settled within `ms`. */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -346,10 +356,15 @@ export function useVoiceAgent(args: {
   // Even then the recruiter finishes their sentence and anything the candidate
   // says in the meantime cancels the scheduled hang-up.
   const pendingCloseRef = useRef<CallCloseReason | null>(null);
-  const closeTimerRef = useRef<number | null>(null);
   const closingRef = useRef(false);
   const abuseWarnedRef = useRef(false);
   const endRef = useRef<() => void>(() => {});
+  /** Counts finished recruiter replies, so a close can wait for the last one. */
+  const replyDoneSeqRef = useRef(0);
+  /** Polling waiter that hangs up only once the line has gone quiet. */
+  const closePollRef = useRef<number | null>(null);
+  /** Set once a deal is agreed; makes the acceptance hang-up uncancellable. */
+  const acceptCloseRef = useRef(false);
 
   // Duplicate-turn guards. A repeated finalisation used to print the recruiter's
   // sentence twice AND get re-parsed as a fresh offer, which is how the panel
@@ -397,10 +412,23 @@ export function useVoiceAgent(args: {
     setState((s) => ({ ...s, ...p }));
   }, []);
 
+  /** Stop the close waiter, if one is running. */
+  const stopClosePoll = useCallback(() => {
+    if (closePollRef.current != null) {
+      window.clearInterval(closePollRef.current);
+      closePollRef.current = null;
+    }
+  }, []);
+
   /**
-   * End the call gracefully. The banner goes up immediately, but the socket
-   * stays open long enough for the recruiter's last line to finish playing —
-   * hanging up on top of their sentence is the one thing this must never do.
+   * End the call gracefully.
+   *
+   * The banner goes up immediately, but the socket stays open until the line is
+   * genuinely quiet: a reply has finished since we asked to close, nothing is
+   * in flight, nothing is left to play, and it has stayed that way for
+   * CLOSE_QUIET_MS. Waiting on measured silence rather than a guessed duration
+   * is the only way to be sure we never hang up mid-sentence, however long the
+   * recruiter's closing line runs.
    */
   const closeCall = useCallback(
     (outcome: CallCloseReason) => {
@@ -408,20 +436,43 @@ export function useVoiceAgent(args: {
       closingRef.current = true;
       pendingCloseRef.current = null;
       patch({ dealClosed: { outcome } });
-      const wait = Math.max(CLOSE_TAIL_MS, playback.remainingMs() + 800);
-      closeTimerRef.current = window.setTimeout(() => {
-        closeTimerRef.current = null;
-        endRef.current();
-      }, wait);
+      const armSeq = replyDoneSeqRef.current;
+      const startedAt = Date.now();
+      let idleSince = 0;
+      stopClosePoll();
+      closePollRef.current = window.setInterval(() => {
+        if (endedByUsRef.current) {
+          stopClosePoll();
+          return;
+        }
+        const heardReply = replyDoneSeqRef.current > armSeq;
+        const busy =
+          agentSpeakingRef.current ||
+          playback.remainingMs() > 0 ||
+          // A deadlock close also waits for the candidate: nothing they said may
+          // be left unanswered. (An agreed deal is final and skips this.)
+          (!acceptCloseRef.current &&
+            (turnInFlightRef.current || pendingTurnsRef.current.length > 0));
+        if (heardReply && !busy) {
+          if (idleSince === 0) idleSince = Date.now();
+          else if (Date.now() - idleSince >= CLOSE_QUIET_MS) {
+            stopClosePoll();
+            endRef.current();
+            return;
+          }
+        } else {
+          idleSince = 0;
+        }
+        if (Date.now() - startedAt >= CLOSE_MAX_WAIT_MS) {
+          stopClosePoll();
+          endRef.current();
+        }
+      }, CLOSE_POLL_MS);
     },
-    [patch, playback],
+    [patch, playback, stopClosePoll],
   );
   const closeCallRef = useRef(closeCall);
   closeCallRef.current = closeCall;
-
-  // A done deal is not un-done by a thank-you, so the acceptance hang-up is
-  // tracked separately from the cancellable deadlock one.
-  const acceptCloseRef = useRef(false);
 
   /**
    * A scheduled hang-up is cancelled the moment the candidate says anything.
@@ -429,28 +480,24 @@ export function useVoiceAgent(args: {
    */
   const cancelPendingClose = useCallback(() => {
     if (acceptCloseRef.current) return; // the deal is agreed; the call is over
-    if (closeTimerRef.current != null) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
+    stopClosePoll();
     if (closingRef.current && !endedByUsRef.current) {
       closingRef.current = false;
       patch({ dealClosed: null });
     }
-  }, [patch]);
+  }, [patch, stopClosePoll]);
   const cancelPendingCloseRef = useRef(cancelPendingClose);
   cancelPendingCloseRef.current = cancelPendingClose;
 
   /**
-   * The deal is agreed. End the call — but only once the recruiter has finished
-   * the sentence that announced it. If they are mid-reply, reply.done closes it;
-   * otherwise there is nothing left to say and we drain what is already playing
-   * and go.
+   * The deal is agreed, so the call will close — but only after the recruiter
+   * has finished announcing it. The waiter does the waiting; there is nothing
+   * to schedule here.
    */
   const armAcceptClose = useCallback(() => {
     if (acceptCloseRef.current || endedByUsRef.current) return;
     acceptCloseRef.current = true;
-    if (!agentSpeakingRef.current) closeCallRef.current("accepted");
+    closeCallRef.current("accepted");
   }, []);
   const armAcceptCloseRef = useRef(armAcceptClose);
   armAcceptCloseRef.current = armAcceptClose;
@@ -1240,21 +1287,11 @@ export function useVoiceAgent(args: {
               pendingToolsRef.current = []; // agent moved on; drop stale results
             } else {
               flushPendingTools();
-              if (acceptCloseRef.current) {
-                // The deal is agreed: only now, with the recruiter's closing
-                // line complete, is it safe to hang up.
-                closeCallRef.current("accepted");
-              } else if (
-                // Only close once the recruiter has finished speaking AND
-                // nothing the candidate said is still waiting for an answer.
-                // Hanging up on a queued utterance is exactly what must never
-                // happen.
-                pendingCloseRef.current &&
-                !turnInFlightRef.current &&
-                pendingTurnsRef.current.length === 0
-              ) {
-                closeCallRef.current(pendingCloseRef.current);
-              }
+              // A finished reply is the proof the close waiter waits for. Arm
+              // first (capturing the sequence), then record the reply, so the
+              // waiter immediately knows the closing line has been delivered.
+              if (pendingCloseRef.current) closeCallRef.current(pendingCloseRef.current);
+              replyDoneSeqRef.current += 1;
             }
             // Whatever the user said while the recruiter spoke gets its turn
             // now — and if a turn was somehow stuck, this unjams it.
@@ -1362,6 +1399,8 @@ export function useVoiceAgent(args: {
     closingRef.current = false;
     acceptCloseRef.current = false;
     abuseWarnedRef.current = false;
+    replyDoneSeqRef.current = 0;
+    stopClosePoll();
     patch({
       status: "connecting",
       error: null,
@@ -1379,7 +1418,7 @@ export function useVoiceAgent(args: {
     } finally {
       connectingRef.current = false;
     }
-  }, [connectInner, patch]);
+  }, [connectInner, patch, stopClosePoll]);
 
   const end = useCallback(() => {
     endedByUsRef.current = true;
@@ -1401,10 +1440,7 @@ export function useVoiceAgent(args: {
     pendingCloseRef.current = null;
     closingRef.current = false;
     acceptCloseRef.current = false;
-    if (closeTimerRef.current != null) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
+    stopClosePoll();
     patch({
       status: "ended",
       agentSpeaking: false,
@@ -1414,7 +1450,7 @@ export function useVoiceAgent(args: {
       deferral: null,
       offerNotice: null,
     });
-  }, [flushEvents, mic, patch, playback, send]);
+  }, [flushEvents, mic, patch, playback, send, stopClosePoll]);
 
   // The websocket handlers reach the hang-up through this ref so the close path
   // does not depend on callback definition order (same trick as the turn pump).
@@ -1465,10 +1501,8 @@ export function useVoiceAgent(args: {
     closingRef.current = false;
     acceptCloseRef.current = false;
     abuseWarnedRef.current = false;
-    if (closeTimerRef.current != null) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
+    replyDoneSeqRef.current = 0;
+    stopClosePoll();
     window.setTimeout(() => {
       void connectInner(null)
         .catch((err) => {
@@ -1478,7 +1512,7 @@ export function useVoiceAgent(args: {
           restartingRef.current = false;
         });
     }, 300);
-  }, [clearSetupTimers, connectInner, mic, patch, playback]);
+  }, [clearSetupTimers, connectInner, mic, patch, playback, stopClosePoll]);
 
   // Elapsed timer.
   useEffect(() => {
@@ -1593,6 +1627,7 @@ export function useVoiceAgent(args: {
   // Cleanup on unmount.
   useEffect(() => {
     return () => {
+      stopClosePoll();
       clearSetupTimers();
       mic.stop();
       playback.close();

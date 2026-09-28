@@ -72,30 +72,30 @@ export function VoiceSession(props: Props) {
     }
   }, [props.attemptId, router, state.transcript, state.dealClosed?.outcome]);
 
-  // The hook hangs up itself once a deal is agreed — and only after the
-  // recruiter has finished announcing it. This timer is purely a safety net for
-  // the case where no reply ever completed, so it is deliberately generous.
+  // The hook hangs the call up itself once a deal is agreed — and only after
+  // the recruiter has finished announcing it. This is a pure last-resort net so
+  // a wedged socket cannot leave the UI hanging, so it sits past the hook's own
+  // ceiling and deliberately does not score.
   const accepted = state.acceptedOffer != null;
   useEffect(() => {
     if (!accepted) return;
-    const t = window.setTimeout(() => {
-      end();
-      void complete();
-    }, 8000);
+    const t = window.setTimeout(() => end(), 25_000);
     return () => window.clearTimeout(t);
-  }, [accepted, complete, end]);
+  }, [accepted, end]);
 
-  // The call closed itself — a deal, a deadlock, or abuse. The socket is
-  // already down by then, so score the attempt a beat after the banner lands.
+  // The call closed itself — a deal, a deadlock, or abuse. Score only once the
+  // socket is actually down: scoring navigates to the report, and doing that
+  // while the recruiter is still speaking would cut them off.
   const dealClosed = state.dealClosed;
   const closedOutcome = dealClosed?.outcome ?? null;
+  const callEnded = state.status === "ended";
   useEffect(() => {
-    if (!closedOutcome) return;
+    if (!closedOutcome || !callEnded) return;
     const t = window.setTimeout(() => {
       void complete();
-    }, 6000);
+    }, 1500);
     return () => window.clearTimeout(t);
-  }, [closedOutcome, complete]);
+  }, [closedOutcome, callEnded, complete]);
 
   /** Banner copy per way a call can end — kept in one place to stay readable. */
   const closeCopy = closedOutcome
