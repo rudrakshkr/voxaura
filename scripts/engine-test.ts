@@ -13,6 +13,7 @@ import {
   classifyUserMove,
   closingOutcome,
   decideRecruiterMove,
+  detectHostileLanguage,
   dedupeTranscriptTurns,
   extractSpokenPackage,
   maxOfferTotal,
@@ -368,21 +369,39 @@ console.log("\nP. Insisting on a yes is honoured; a lowball yes is not capitulat
   check("a second yes closes the deal", r2.move.kind === "accept", `got ${r2.move.kind}`);
 }
 
-console.log("\nQ. A truly dead negotiation closes the call");
+console.log("\nQ. Only a genuinely worked-over deadlock closes the call");
 {
-  // Closing signals drive the client to end the call instead of leaving the
-  // candidate on a dead line.
+  // Closing signals drive the client to end the call. They must stay rare: a
+  // single firm "no" is a normal move, not the end of the negotiation.
   const state = freshState();
   runTurn(state, "Hello, thanks for taking the time.");
   const walk = runTurn(state, "I'm out — I'll walk away.");
   check("a walk-away with no recovery left closes as walked_away", closingOutcome(walk.move) === "walked_away", `got ${closingOutcome(walk.move)}`);
 
-  const state2 = freshState();
-  const first = runTurn(state2, "I want 190000.");
+  // Early in a call, a firm hold never ends it — however frustrated either side is.
+  const early = freshState();
+  const first = runTurn(early, "I want 190000.");
   check("a first, ordinary hold does not close the call", closingOutcome(first.move) === null, `got ${closingOutcome(first.move)}`);
-  runTurn(state2, "I want 190000.");
-  const third = runTurn(state2, "I want 190000.");
-  check("a repeated dead-end ask closes as stalemate", closingOutcome(third.move) === "stalemate", `got ${closingOutcome(third.move)}`);
+  runTurn(early, "I want 190000.");
+  const third = runTurn(early, "I want 190000.");
+  check("a repeated ask early in the call still only holds", third.move.kind === "hold_firm" && third.move.final === true, `got ${third.move.kind}`);
+  check("and it does not close the call", closingOutcome(third.move) === null, `got ${closingOutcome(third.move)}`);
+
+  // The same repeated ask, late in a long negotiation, is a real deadlock.
+  const long = freshState();
+  const warmups = [
+    "Thanks for the time today.",
+    "I'm excited about the role and the team.",
+    "I have three years leading audio infrastructure work.",
+    "Could you tell me more about the scope of the team?",
+    "What does the growth path look like from here?",
+    "I appreciate you walking me through the package.",
+  ];
+  for (const u of warmups) runTurn(long, u);
+  runTurn(long, "I want 190000.");
+  runTurn(long, "I want 190000.");
+  const deep = runTurn(long, "I want 190000.");
+  check("the same repeated ask deep in the call closes as stalemate", closingOutcome(deep.move) === "stalemate", `got ${closingOutcome(deep.move)}`);
 
   const state3 = freshState();
   const accept = (() => {
@@ -391,6 +410,17 @@ console.log("\nQ. A truly dead negotiation closes the call");
     return runTurn(state3, "We have a deal at those terms.").move;
   })();
   check("an acceptance never carries a close signal", closingOutcome(accept) === null, `got ${closingOutcome(accept)}`);
+}
+
+console.log("\nR. Hostile language is detected; ordinary hard bargaining is not");
+{
+  check("profanity is flagged", detectHostileLanguage("This is bullshit and you know it."));
+  check("a directed insult is flagged", detectHostileLanguage("You're an idiot if you think that's fair."));
+  check("'shut up' is flagged", detectHostileLanguage("Shut up and give me the number."));
+  check("a hard but civil push is not flagged", !detectHostileLanguage("That's a lowball and I'm not taking it."));
+  check("a walk-away threat is not flagged", !detectHostileLanguage("I'll walk away and take the other offer."));
+  check("self-reference to competence is not flagged", !detectHostileLanguage("I don't want to sound incompetent, but the band looks off."));
+  check("an ordinary ask is not flagged", !detectHostileLanguage("I need 165,000 base and 20,000 sign-on."));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

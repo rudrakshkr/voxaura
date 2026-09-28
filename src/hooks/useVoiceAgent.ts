@@ -11,6 +11,7 @@ import {
 } from "@/lib/voice/protocol";
 import type { BatchedEvent, CompPackage, TranscriptTurn } from "@/lib/types";
 import {
+  detectHostileLanguage,
   extractSpokenPackage,
   transcriptSignature,
   type CloseOutcome,
@@ -144,12 +145,20 @@ export interface VoiceAgentState {
   /** True when mic frames actually reached the call in the last ~1.5s. */
   audioFlowing: boolean;
   /**
-   * Set when the engine declares the negotiation over with no deal — the call
-   * closes itself and the UI shows a "deal closed" banner rather than leaving
-   * the user on a dead line.
+   * Set when the negotiation is genuinely over — the engine declares a deadlock
+   * or the candidate is abusive. The call closes itself and the UI shows a
+   * banner rather than leaving the user on a dead line.
    */
-  dealClosed: { outcome: CloseOutcome } | null;
+  dealClosed: { outcome: CallCloseReason } | null;
+  /**
+   * True once the candidate has been warned about hostile language. A second
+   * offence ends the call — respect is not part of the negotiation.
+   */
+  abuseWarning: boolean;
 }
+
+/** Why the client hung up: an engine-declared deadlock, or abuse. */
+export type CallCloseReason = CloseOutcome | "abuse";
 
 export interface InlineAgentConfig {
   systemPrompt: string;
@@ -287,6 +296,7 @@ export function useVoiceAgent(args: {
     audioWarning: null,
     audioFlowing: false,
     dealClosed: null,
+    abuseWarning: false,
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -331,12 +341,14 @@ export function useVoiceAgent(args: {
   // never ended (missing reply.done) instead of staying deaf forever.
   const agentSpeakingAtRef = useRef(0);
 
-  // Closing the call on a deadlock: the engine flips `final` when the recruiter
-  // has no further room. A definite walk-away closes at once; a "no more room"
-  // hold only closes once the candidate pushes back again, so a real acceptance
-  // still gets its chance.
+  // Closing the call. The engine only names a `close` outcome for a genuine,
+  // worked-over deadlock (or an explicit walk-away), never a single firm "no".
+  // Even then the recruiter finishes their sentence and anything the candidate
+  // says in the meantime cancels the scheduled hang-up.
   const pendingCloseRef = useRef<CloseOutcome | null>(null);
-  const finalHoldsRef = useRef(0);
+  const closeTimerRef = useRef<number | null>(null);
+  const closingRef = useRef(false);
+  const abuseWarnedRef = useRef(false);
   const endRef = useRef<() => void>(() => {});
 
   // Duplicate-turn guards. A repeated finalisation used to print the recruiter's
@@ -384,6 +396,45 @@ export function useVoiceAgent(args: {
     if (p.agentSpeaking !== undefined) agentSpeakingRef.current = p.agentSpeaking;
     setState((s) => ({ ...s, ...p }));
   }, []);
+
+  /**
+   * End the call gracefully. The banner goes up immediately, but the socket
+   * stays open long enough for the recruiter's last line to finish playing —
+   * hanging up on top of their sentence is the one thing this must never do.
+   */
+  const closeCall = useCallback(
+    (outcome: CallCloseReason) => {
+      if (endedByUsRef.current || closingRef.current) return;
+      closingRef.current = true;
+      pendingCloseRef.current = null;
+      patch({ dealClosed: { outcome } });
+      const wait = Math.max(CLOSE_TAIL_MS, playback.remainingMs() + 800);
+      closeTimerRef.current = window.setTimeout(() => {
+        closeTimerRef.current = null;
+        endRef.current();
+      }, wait);
+    },
+    [patch, playback],
+  );
+  const closeCallRef = useRef(closeCall);
+  closeCallRef.current = closeCall;
+
+  /**
+   * A scheduled hang-up is cancelled the moment the candidate says anything.
+   * If there is still something to say, there is still something to negotiate.
+   */
+  const cancelPendingClose = useCallback(() => {
+    if (closeTimerRef.current != null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+    if (closingRef.current && !endedByUsRef.current) {
+      closingRef.current = false;
+      patch({ dealClosed: null });
+    }
+  }, [patch]);
+  const cancelPendingCloseRef = useRef(cancelPendingClose);
+  cancelPendingCloseRef.current = cancelPendingClose;
 
   /**
    * Promote a new authoritative package, keeping the previous one for deltas.
@@ -709,20 +760,11 @@ export function useVoiceAgent(args: {
           return false; // engine unreachable — the pump re-queues the utterance
         }
 
-        // The engine tells us when the recruiter has nothing left to give. A
-        // clean walk-away ends the call at once; a "no more room" hold only ends
-        // it after the candidate pushes back a second time, so a genuine
-        // acceptance (which never comes back as `final`) still gets its chance.
-        if (data?.close === "walked_away") {
-          finalHoldsRef.current = 0;
-          pendingCloseRef.current = "walked_away";
-        } else if (data?.final) {
-          finalHoldsRef.current += 1;
-          if (finalHoldsRef.current >= 2) pendingCloseRef.current = "stalemate";
-        } else {
-          finalHoldsRef.current = 0;
-          pendingCloseRef.current = null;
-        }
+        // The engine names a `close` only when the negotiation is genuinely
+        // over — a worked-over deadlock, or a walk-away with no recovery left.
+        // A mere `final` hold is just "that's my best" and never ends the call,
+        // so the candidate can still accept or bring something new.
+        pendingCloseRef.current = data?.close ?? null;
 
         const lines: string[] = [`SYSTEM DIRECTIVE (obey exactly): ${d.verdict}`];
         // The on-table package travels with every directive: the model restates
@@ -1073,6 +1115,31 @@ export function useVoiceAgent(args: {
               partialUser: null,
               transcript: [...s.transcript, turn],
             }));
+
+            // They are still talking, so they are still negotiating: any
+            // pending hang-up is off the table the moment a new utterance
+            // lands. If what they said is abusive it is re-decided below.
+            cancelPendingCloseRef.current();
+
+            // Hostile language is not a negotiation move, so it never reaches
+            // the engine. The recruiter warns once; a second offence ends the
+            // call.
+            if (detectHostileLanguage(event.text)) {
+              if (abuseWarnedRef.current) {
+                closeCallRef.current("abuse");
+              } else {
+                abuseWarnedRef.current = true;
+                patch({ abuseWarning: true });
+                send({
+                  type: "conversation.message",
+                  role: "system",
+                  content:
+                    "The candidate just insulted you. Stay calm and professional: tell them briefly that you are glad to keep working on the numbers, but you will end the call if that language continues. Do not answer the insult, do not apologise, and do not move any figure this turn.",
+                });
+              }
+              break;
+            }
+
             pendingTurnsRef.current.push({ text: event.text, interrupted: false, attempts: 0 });
             // Deliver the engine directive NOW instead of waiting for the
             // recruiter's reply to finish — the reply is generated moments after
@@ -1143,14 +1210,15 @@ export function useVoiceAgent(args: {
               pendingToolsRef.current = []; // agent moved on; drop stale results
             } else {
               flushPendingTools();
-              // The negotiation is over and the recruiter has finished saying
-              // so: close the call (after the closing line plays) instead of
-              // leaving the candidate on a dead line.
-              if (pendingCloseRef.current && !endedByUsRef.current) {
-                const outcome = pendingCloseRef.current;
-                pendingCloseRef.current = null;
-                patch({ dealClosed: { outcome } });
-                window.setTimeout(() => endRef.current(), CLOSE_TAIL_MS);
+              // Only close once the recruiter has finished speaking AND nothing
+              // the candidate said is still waiting for an answer. Hanging up
+              // on a queued utterance is exactly what the user must never see.
+              if (
+                pendingCloseRef.current &&
+                !turnInFlightRef.current &&
+                pendingTurnsRef.current.length === 0
+              ) {
+                closeCallRef.current(pendingCloseRef.current);
               }
             }
             // Whatever the user said while the recruiter spoke gets its turn
@@ -1256,7 +1324,8 @@ export function useVoiceAgent(args: {
     agentSpeakingAtRef.current = 0;
     turnInFlightRef.current = false;
     pendingCloseRef.current = null;
-    finalHoldsRef.current = 0;
+    closingRef.current = false;
+    abuseWarnedRef.current = false;
     patch({
       status: "connecting",
       error: null,
@@ -1265,6 +1334,7 @@ export function useVoiceAgent(args: {
       deferral: null,
       offerNotice: null,
       dealClosed: null,
+      abuseWarning: false,
     });
     try {
       await connectInner(null);
@@ -1293,7 +1363,11 @@ export function useVoiceAgent(args: {
     agentSpeakingAtRef.current = 0;
     turnInFlightRef.current = false;
     pendingCloseRef.current = null;
-    finalHoldsRef.current = 0;
+    closingRef.current = false;
+    if (closeTimerRef.current != null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
     patch({
       status: "ended",
       agentSpeaking: false,
@@ -1345,12 +1419,18 @@ export function useVoiceAgent(args: {
       justInterrupted: false,
       recruiterThinking: false,
       dealClosed: null,
+      abuseWarning: false,
     });
     pendingTurnsRef.current = []; // restart = fresh relay
     agentSpeakingAtRef.current = 0;
     turnInFlightRef.current = false;
     pendingCloseRef.current = null;
-    finalHoldsRef.current = 0;
+    closingRef.current = false;
+    abuseWarnedRef.current = false;
+    if (closeTimerRef.current != null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
     window.setTimeout(() => {
       void connectInner(null)
         .catch((err) => {

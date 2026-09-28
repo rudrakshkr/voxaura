@@ -152,6 +152,43 @@ export function classifyUserMove(
   };
 }
 
+/**
+ * Hostile language aimed at the recruiter.
+ *
+ * Deliberately narrow. A heated negotiation is not abuse — pushing hard, being
+ * blunt, even threatening to walk are all normal and handled by the economics.
+ * Only genuine insults and profanity count, and even then the recruiter warns
+ * once before the call ends (see the voice client).
+ */
+/** Profanity and slurs: hostile however they are used (no leading \b, so
+ * compounds like "bullshit" and "clusterfuck" are caught too). */
+const PROFANITY: RegExp[] = [
+  /f+u+c+k+(?:ing|in|er|ers|ed|s)?\b/,
+  /s+h+i+t+(?:ty|head|hole|bag|ting|s)?\b/,
+  /bitch(?:es|y|ing)?\b/,
+  /asshole?s?\b/,
+  /bastard?s?\b/,
+  /(?:dumbass|jackass|scumbag|cretin)\b/,
+  /piece of (?:shit|crap)\b/,
+];
+
+/**
+ * Insults that only count when they are aimed at the recruiter — "I'm not an
+ * idiot, I know what this role pays" is a negotiation, not abuse.
+ */
+const DIRECTED_INSULT: RegExp[] = [
+  /\b(?:you(?:'re| are)?|youre)\s+(?:an?\s+)?(?:idiot|moron|imbecile|fool|liar|clown|dumb|stupid|incompetent|useless|worthless|pathetic)\b/,
+  /\byour\s+(?:company|firm|team)\s+is\s+(?:a\s+)?(?:joke|trash|garbage|pathetic|stupid|dumb)\b/,
+  /\bshut\s+(?:the\s+)?(?:f+u+c+k+\s+)?up\b/,
+  /\b(?:screw|f+u+c+k+)\s+you\b/,
+  /\b(?:stupid|dumb|ignorant)\s+(?:recruiter|bitch|ass|woman|man|guy|lady)\b/,
+];
+
+export function detectHostileLanguage(text: string): boolean {
+  const t = ` ${text.toLowerCase().replace(/[^a-z0-9'\s]/g, " ")} `;
+  return PROFANITY.some((re) => re.test(t)) || DIRECTED_INSULT.some((re) => re.test(t));
+}
+
 // ---------------------------------------------------------------------------
 // Recruiter economic decision (deterministic)
 // ---------------------------------------------------------------------------
@@ -212,13 +249,16 @@ export type CloseOutcome = "walked_away" | "stalemate";
 
 /**
  * The outcome a call should end with when this move is the recruiter's last
- * word, or null when the negotiation can still continue. A `final` hold means
- * the recruiter has no further room: the candidate must take what is on the
- * table or the call is a deadlock — leaving it open just strands both sides.
+ * word, or null when the negotiation can still continue.
+ *
+ * Note that `final` alone is NOT enough: a firm "that's my best" is a normal
+ * move the candidate can still accept or work around. Only a move that carries
+ * an explicit `close` — a walk-away with no recovery left, or a deadlock in a
+ * negotiation that has genuinely been worked over — ends the call.
  */
 export function closingOutcome(move: RecruiterMove): CloseOutcome | null {
-  if (move.kind !== "hold_firm" || !move.final) return null;
-  return move.close ?? "stalemate";
+  if (move.kind !== "hold_firm") return null;
+  return move.close ?? null;
 }
 
 export interface DecisionInput {
@@ -278,6 +318,16 @@ export function acceptsPackage(hidden: HiddenState, pkg: CompPackage): boolean {
     pkg.base >= acceptanceThreshold(hidden) || total(pkg) >= acceptanceTotalThreshold(hidden)
   );
 }
+
+/**
+ * How much back-and-forth a call needs before a deadlock may close it.
+ *
+ * Ending a call on the first firm "no" is worse than letting it run: the
+ * candidate may still accept, or bring something new. Only a negotiation that
+ * has genuinely been worked over gets a definite close — "after a lot of
+ * negotiating, we can't agree" — never a single held line.
+ */
+const DEADLOCK_MIN_ROUNDS = 8;
 
 /** Maximum share of the REMAINING gap the recruiter concedes in one step. */
 function maxConcessionShare(hidden: HiddenState, state: EngineState): number {
@@ -353,9 +403,11 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
     // worse than taking a modest deal — the score tells the candidate what they
     // left behind.
     if (state.acceptAttempts >= 2) return { kind: "accept", package: state.currentOffer };
-    // Premature close on a package below the bar → one real counter.
+    // Premature close on a package below the bar → one real counter. Never a
+    // closing hold: the candidate is trying to say yes, so a firm "that's my
+    // best" has to leave room for them to insist.
     const target = Math.min(offerCap, curTotal + Math.max(MIN_MOVE, Math.round(curTotal * 0.03)));
-    return counterOrHold(hidden, state, target, []);
+    return counterOrHold(hidden, state, target, [], false);
   }
 
   // 3. Leverage: ALWAYS verify before reacting. Verification needs a stated,
@@ -376,7 +428,7 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
     if (!hasDetail || claim == null) {
       state.leverageChallenges += 1;
       // Two challenges is a conversation; a third identical one would be a loop.
-      if (state.leverageChallenges >= 3) return { kind: "hold_firm", final: true, close: "stalemate" };
+      if (state.leverageChallenges >= 3) return finalHold(state, false);
       return { kind: "challenge_leverage" };
     }
     const gap = Math.max(0, offerCap - curTotal);
@@ -414,8 +466,9 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
         );
         if (moved.kind === "counter") return moved;
       }
-      // No approval available: the standing package IS the answer.
-      return { kind: "hold_firm", final: true, close: "stalemate" };
+      // No approval available: the standing package IS the answer. This is a
+      // definite answer to their question, not the end of the call.
+      return finalHold(state, false);
     }
     return { kind: "probe", question: informationAnswerQuestion(hidden, state) };
   }
@@ -448,8 +501,9 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
         : { kind: "hold_firm" };
     }
 
-    // The same number, a third time, with nothing new behind it.
-    if (state.repeatAskCount >= 2) return { kind: "hold_firm", final: true, close: "stalemate" };
+    // The same number, a third time, with nothing new behind it. This is the
+    // clearest deadlock there is — but it still has to be a worked-over call.
+    if (state.repeatAskCount >= 2) return finalHold(state);
 
     if (!justified) {
       state.turnsWithoutUserMovement += 1;
@@ -512,15 +566,30 @@ const MIN_MOVE = 500;
  * a "counter" that changes nothing produced a turn where the recruiter restated
  * the same numbers, which is exactly the repetition this engine must avoid.
  */
+/**
+ * A definitive hold. Before the negotiation has been worked over this is just a
+ * firm "that's my best" and the conversation continues; only a deep deadlock is
+ * allowed to end the call. `closable: false` covers the turns where the
+ * candidate is the one trying to close — the door stays open so they can insist
+ * (and get their yes), so those never end the call.
+ */
+function finalHold(state: EngineState, closable = true): RecruiterMove {
+  if (closable && state.round >= DEADLOCK_MIN_ROUNDS) {
+    return { kind: "hold_firm", final: true, close: "stalemate" };
+  }
+  return { kind: "hold_firm", final: true };
+}
+
 function counterOrHold(
   hidden: HiddenState,
   state: EngineState,
   targetTotal: number,
   conditions: string[],
+  closable = true,
 ): RecruiterMove {
   const from = total(state.currentOffer);
   const pkg = bestSplit(hidden, state, from, Math.max(from, targetTotal));
-  if (total(pkg) - from < MIN_MOVE) return { kind: "hold_firm", final: true, close: "stalemate" };
+  if (total(pkg) - from < MIN_MOVE) return finalHold(state, closable);
   state.turnsWithoutUserMovement = 0;
   return { kind: "counter", package: pkg, conditions };
 }

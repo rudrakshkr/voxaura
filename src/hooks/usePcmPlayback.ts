@@ -75,5 +75,16 @@ export function usePcmPlayback() {
   /** True once any recruiter audio has arrived since hook creation. */
   const hasReceivedAudio = useCallback(() => receivedAudioRef.current, []);
 
-  return { ensureCtx, play, flush, close, hasReceivedAudio };
+  /**
+   * Milliseconds of already-received speech still queued to play. Lets the
+   * close path wait for the recruiter to finish their sentence instead of
+   * flushing the audio and cutting them off mid-word.
+   */
+  const remainingMs = useCallback(() => {
+    const ctx = ctxRef.current;
+    if (!ctx || ctx.state === "closed") return 0;
+    return Math.max(0, Math.round((cursorRef.current - ctx.currentTime) * 1000));
+  }, []);
+
+  return { ensureCtx, play, flush, close, hasReceivedAudio, remainingMs };
 }

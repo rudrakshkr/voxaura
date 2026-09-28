@@ -53,8 +53,10 @@ export function VoiceSession(props: Props) {
             interrupted: t.interrupted,
             at_ms: t.atMs,
           })),
-          // Outcome is server-authoritative; this is only a fallback hint.
-          outcome: null,
+          // Outcome is server-authoritative; this is only a fallback hint, and
+          // it only counts when the engine neither accepted nor saw the
+          // candidate walk. An abuse close is the recruiter ending the call.
+          outcome: state.dealClosed?.outcome === "abuse" ? "rejected" : null,
         }),
       });
       if (!res.ok) {
@@ -68,7 +70,7 @@ export function VoiceSession(props: Props) {
     } finally {
       completingRef.current = false;
     }
-  }, [props.attemptId, router, state.transcript]);
+  }, [props.attemptId, router, state.transcript, state.dealClosed?.outcome]);
 
   // Auto-complete shortly after the engine validates an acceptance.
   const accepted = state.acceptedOffer != null;
@@ -142,31 +144,53 @@ export function VoiceSession(props: Props) {
         audioFlowing={state.audioFlowing}
       />
 
-      {/* The recruiter said they were done and no deal was reachable, so the
-          call closed itself. Say so plainly instead of leaving a silent line. */}
+      {/* The candidate crossed a line. The recruiter has warned; one more
+          offence ends the call, so say that now rather than after the fact. */}
+      {state.abuseWarning && !dealClosed && state.status === "ready" && (
+        <div className="rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+          <p className="font-medium">That language won&apos;t work here</p>
+          <p className="mt-1 text-red-100/80">
+            The recruiter has warned you. Keep it professional — if it happens again the call
+            ends and this attempt is scored as-is.
+          </p>
+        </div>
+      )}
+
+      {/* The negotiation is genuinely over, so the call closed itself. Say so
+          plainly instead of leaving the user on a silent line. */}
       {dealClosed && (
         <div
           className={[
             "rounded-xl border px-4 py-4",
             dealClosed.outcome === "walked_away"
               ? "border-rose-500/30 bg-rose-500/10"
-              : "border-slate-400/25 bg-white/[0.06]",
+              : dealClosed.outcome === "abuse"
+                ? "border-red-500/40 bg-red-500/10"
+                : "border-slate-400/25 bg-white/[0.06]",
           ].join(" ")}
         >
           <div className="flex items-start gap-3">
             <span className="text-2xl leading-none">
-              {dealClosed.outcome === "walked_away" ? "🚪" : "🤝"}
+              {dealClosed.outcome === "walked_away"
+                ? "🚪"
+                : dealClosed.outcome === "abuse"
+                  ? "⛔"
+                  : "🤝"}
             </span>
             <div className="min-w-0">
               <p className="font-semibold text-white">
                 {dealClosed.outcome === "walked_away"
                   ? "You walked away — the call is closed"
-                  : "No agreement — the call is closed"}
+                  : dealClosed.outcome === "abuse"
+                    ? "Call ended — the recruiter stopped the negotiation"
+                    : "No agreement — the call is closed"}
               </p>
               <p className="mt-1 text-sm text-white/65">
                 {dealClosed.outcome === "walked_away"
                   ? "The negotiation ended without a deal. Your transcript is saved, and scoring shows exactly where it turned."
-                  : "The recruiter had no room left and was not going to meet your number, so the call closed rather than dragging on. Scoring will show what was achievable."}
+                  : dealClosed.outcome === "abuse"
+                    ? "You were warned about the language and it continued, so the recruiter ended the call. A real negotiation only works while both sides stay respectful."
+                    : "After working the numbers for a while the recruiter had no room left and was not going to meet your ask, so the call closed rather than dragging on. Scoring will show what was achievable."}
               </p>
             </div>
           </div>
