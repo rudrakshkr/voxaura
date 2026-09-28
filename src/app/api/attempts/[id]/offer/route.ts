@@ -38,6 +38,13 @@ const BodySchema = z
       .nullish(),
     /** Conditions/notes attached to the offer, shown on the panel. */
     conditions: z.array(z.string().min(1).max(160)).max(3).nullish(),
+    /**
+     * Set by the `accept_user_offer` tool path: the recruiter has agreed to the
+     * candidate's package, so the deal is final and must be recorded as such.
+     * Without this a model-initiated acceptance left only a generic commitment
+     * event, and the report scored an agreed deal as a stalemate.
+     */
+    accepted: z.boolean().default(false),
     // Call-elapsed milliseconds. Clamped server-side before insert — see
     // clampEventAtMs — because a naive client sending Date.now() epoch-millis
     // would overflow the 4-byte integer column.
@@ -125,6 +132,23 @@ export const POST = handle(
       }
     }
 
+    // 1b. An acceptance confirms the deal. The engine normally records this on
+    //     its own accept turn, but the voice model can call accept_user_offer
+    //     itself — and then nothing downstream knew a deal had been struck.
+    if (body.data.accepted) {
+      events.push({
+        type: "acceptance",
+        actor: "opponent",
+        source: "tool",
+        payload: {
+          package: standing,
+          impact: "strong",
+          note: "recruiter accepted the candidate's package",
+        },
+        at_ms: atMs,
+      });
+    }
+
     // 2. Deferral → the engine now owes the candidate a real decision.
     const deferred = detectDeferral(text);
     const alreadyPending = state.pendingDecision;
@@ -143,9 +167,13 @@ export const POST = handle(
       });
     }
 
-    if (reconciled?.changed || (deferred && !alreadyPending)) {
+    if (reconciled?.changed || (deferred && !alreadyPending) || body.data.accepted) {
       await setAttemptEngineState(id, serializeEngineState(state));
       if (events.length > 0) await insertEvents(id, events);
+    }
+    if (body.data.accepted) {
+      const { setAttemptOutcomeIfAccepted } = await import("@/lib/db/queries");
+      await setAttemptOutcomeIfAccepted(id, standing, body.data.conditions ?? []);
     }
 
     return Response.json({

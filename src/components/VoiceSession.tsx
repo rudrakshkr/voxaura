@@ -72,20 +72,21 @@ export function VoiceSession(props: Props) {
     }
   }, [props.attemptId, router, state.transcript, state.dealClosed?.outcome]);
 
-  // Auto-complete shortly after the engine validates an acceptance.
+  // The hook hangs up itself once a deal is agreed — and only after the
+  // recruiter has finished announcing it. This timer is purely a safety net for
+  // the case where no reply ever completed, so it is deliberately generous.
   const accepted = state.acceptedOffer != null;
   useEffect(() => {
     if (!accepted) return;
     const t = window.setTimeout(() => {
       end();
       void complete();
-    }, 5000);
+    }, 8000);
     return () => window.clearTimeout(t);
   }, [accepted, complete, end]);
 
-  // The engine closes the call when the recruiter is done and no deal is
-  // possible. The socket is already down by then — score the attempt a beat
-  // after the banner lands, exactly like an accepted deal.
+  // The call closed itself — a deal, a deadlock, or abuse. The socket is
+  // already down by then, so score the attempt a beat after the banner lands.
   const dealClosed = state.dealClosed;
   const closedOutcome = dealClosed?.outcome ?? null;
   useEffect(() => {
@@ -95,6 +96,36 @@ export function VoiceSession(props: Props) {
     }, 6000);
     return () => window.clearTimeout(t);
   }, [closedOutcome, complete]);
+
+  /** Banner copy per way a call can end — kept in one place to stay readable. */
+  const closeCopy = closedOutcome
+    ? {
+        walked_away: {
+          frame: "border-rose-500/30 bg-rose-500/10",
+          icon: "🚪",
+          title: "You walked away — the call is closed",
+          body: "The negotiation ended without a deal. Your transcript is saved, and scoring shows exactly where it turned.",
+        },
+        abuse: {
+          frame: "border-red-500/40 bg-red-500/10",
+          icon: "⛔",
+          title: "Call ended — the recruiter stopped the negotiation",
+          body: "You were warned about the language and it continued, so the recruiter ended the call. A real negotiation only works while both sides stay respectful.",
+        },
+        accepted: {
+          frame: "border-emerald-500/40 bg-emerald-500/10",
+          icon: "🎉",
+          title: "Deal agreed — the call is closed",
+          body: "You and the recruiter settled on a package. Your transcript is saved, and scoring shows how strong the final numbers really were.",
+        },
+        stalemate: {
+          frame: "border-slate-400/25 bg-white/[0.06]",
+          icon: "🤝",
+          title: "No agreement — the call is closed",
+          body: "After working the numbers for a while the recruiter had no room left and was not going to meet your ask, so the call closed rather than dragging on. Scoring will show what was achievable.",
+        },
+      }[closedOutcome]
+    : null;
 
   return (
     <div className="space-y-6">
@@ -158,40 +189,13 @@ export function VoiceSession(props: Props) {
 
       {/* The negotiation is genuinely over, so the call closed itself. Say so
           plainly instead of leaving the user on a silent line. */}
-      {dealClosed && (
-        <div
-          className={[
-            "rounded-xl border px-4 py-4",
-            dealClosed.outcome === "walked_away"
-              ? "border-rose-500/30 bg-rose-500/10"
-              : dealClosed.outcome === "abuse"
-                ? "border-red-500/40 bg-red-500/10"
-                : "border-slate-400/25 bg-white/[0.06]",
-          ].join(" ")}
-        >
+      {dealClosed && closeCopy && (
+        <div className={["rounded-xl border px-4 py-4", closeCopy.frame].join(" ")}>
           <div className="flex items-start gap-3">
-            <span className="text-2xl leading-none">
-              {dealClosed.outcome === "walked_away"
-                ? "🚪"
-                : dealClosed.outcome === "abuse"
-                  ? "⛔"
-                  : "🤝"}
-            </span>
+            <span className="text-2xl leading-none">{closeCopy.icon}</span>
             <div className="min-w-0">
-              <p className="font-semibold text-white">
-                {dealClosed.outcome === "walked_away"
-                  ? "You walked away — the call is closed"
-                  : dealClosed.outcome === "abuse"
-                    ? "Call ended — the recruiter stopped the negotiation"
-                    : "No agreement — the call is closed"}
-              </p>
-              <p className="mt-1 text-sm text-white/65">
-                {dealClosed.outcome === "walked_away"
-                  ? "The negotiation ended without a deal. Your transcript is saved, and scoring shows exactly where it turned."
-                  : dealClosed.outcome === "abuse"
-                    ? "You were warned about the language and it continued, so the recruiter ended the call. A real negotiation only works while both sides stay respectful."
-                    : "After working the numbers for a while the recruiter had no room left and was not going to meet your ask, so the call closed rather than dragging on. Scoring will show what was achievable."}
-              </p>
+              <p className="font-semibold text-white">{closeCopy.title}</p>
+              <p className="mt-1 text-sm text-white/65">{closeCopy.body}</p>
             </div>
           </div>
           <div className="mt-3 flex flex-wrap gap-2">

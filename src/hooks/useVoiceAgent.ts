@@ -157,8 +157,8 @@ export interface VoiceAgentState {
   abuseWarning: boolean;
 }
 
-/** Why the client hung up: an engine-declared deadlock, or abuse. */
-export type CallCloseReason = CloseOutcome | "abuse";
+/** Why the client hung up: an agreed deal, an engine-declared deadlock, or abuse. */
+export type CallCloseReason = CloseOutcome | "abuse" | "accepted";
 
 export interface InlineAgentConfig {
   systemPrompt: string;
@@ -345,7 +345,7 @@ export function useVoiceAgent(args: {
   // worked-over deadlock (or an explicit walk-away), never a single firm "no".
   // Even then the recruiter finishes their sentence and anything the candidate
   // says in the meantime cancels the scheduled hang-up.
-  const pendingCloseRef = useRef<CloseOutcome | null>(null);
+  const pendingCloseRef = useRef<CallCloseReason | null>(null);
   const closeTimerRef = useRef<number | null>(null);
   const closingRef = useRef(false);
   const abuseWarnedRef = useRef(false);
@@ -419,11 +419,16 @@ export function useVoiceAgent(args: {
   const closeCallRef = useRef(closeCall);
   closeCallRef.current = closeCall;
 
+  // A done deal is not un-done by a thank-you, so the acceptance hang-up is
+  // tracked separately from the cancellable deadlock one.
+  const acceptCloseRef = useRef(false);
+
   /**
    * A scheduled hang-up is cancelled the moment the candidate says anything.
    * If there is still something to say, there is still something to negotiate.
    */
   const cancelPendingClose = useCallback(() => {
+    if (acceptCloseRef.current) return; // the deal is agreed; the call is over
     if (closeTimerRef.current != null) {
       window.clearTimeout(closeTimerRef.current);
       closeTimerRef.current = null;
@@ -435,6 +440,20 @@ export function useVoiceAgent(args: {
   }, [patch]);
   const cancelPendingCloseRef = useRef(cancelPendingClose);
   cancelPendingCloseRef.current = cancelPendingClose;
+
+  /**
+   * The deal is agreed. End the call — but only once the recruiter has finished
+   * the sentence that announced it. If they are mid-reply, reply.done closes it;
+   * otherwise there is nothing left to say and we drain what is already playing
+   * and go.
+   */
+  const armAcceptClose = useCallback(() => {
+    if (acceptCloseRef.current || endedByUsRef.current) return;
+    acceptCloseRef.current = true;
+    if (!agentSpeakingRef.current) closeCallRef.current("accepted");
+  }, []);
+  const armAcceptCloseRef = useRef(armAcceptClose);
+  armAcceptCloseRef.current = armAcceptClose;
 
   /**
    * Promote a new authoritative package, keeping the previous one for deltas.
@@ -508,7 +527,13 @@ export function useVoiceAgent(args: {
    */
   const reconcileOffer = useCallback(
     async (
-      input: { agentText?: string; pkg?: CompPackage; conditions?: string[] | null },
+      input: {
+        agentText?: string;
+        pkg?: CompPackage;
+        conditions?: string[] | null;
+        /** The recruiter agreed: record the deal, don't just note the numbers. */
+        accepted?: boolean;
+      },
       atMs: number | null,
     ) => {
       try {
@@ -519,6 +544,7 @@ export function useVoiceAgent(args: {
             agent_text: input.agentText,
             package: input.pkg,
             conditions: input.conditions?.length ? input.conditions : undefined,
+            accepted: input.accepted || undefined,
             at_ms: atMs,
           }),
         });
@@ -626,9 +652,13 @@ export function useVoiceAgent(args: {
           equity: num(args.equity),
         };
         // Same mirror rule: the accepted package is exactly what the recruiter
-        // accepted out loud — shown instantly, persisted by the server.
+        // accepted out loud — shown instantly, persisted by the server. The
+        // deal is done the moment they call this tool, so the call is armed to
+        // close as soon as they finish saying so.
         setOffer(offer);
-        void reconcileOffer({ pkg: offer }, elapsedMs()).then((res) => {
+        patch({ acceptedOffer: offer });
+        armAcceptCloseRef.current();
+        void reconcileOffer({ pkg: offer, accepted: true }, elapsedMs()).then((res) => {
           patch({ acceptedOffer: res?.offer ?? offer });
         });
         queueEvent({
@@ -1210,10 +1240,15 @@ export function useVoiceAgent(args: {
               pendingToolsRef.current = []; // agent moved on; drop stale results
             } else {
               flushPendingTools();
-              // Only close once the recruiter has finished speaking AND nothing
-              // the candidate said is still waiting for an answer. Hanging up
-              // on a queued utterance is exactly what the user must never see.
-              if (
+              if (acceptCloseRef.current) {
+                // The deal is agreed: only now, with the recruiter's closing
+                // line complete, is it safe to hang up.
+                closeCallRef.current("accepted");
+              } else if (
+                // Only close once the recruiter has finished speaking AND
+                // nothing the candidate said is still waiting for an answer.
+                // Hanging up on a queued utterance is exactly what must never
+                // happen.
                 pendingCloseRef.current &&
                 !turnInFlightRef.current &&
                 pendingTurnsRef.current.length === 0
@@ -1325,6 +1360,7 @@ export function useVoiceAgent(args: {
     turnInFlightRef.current = false;
     pendingCloseRef.current = null;
     closingRef.current = false;
+    acceptCloseRef.current = false;
     abuseWarnedRef.current = false;
     patch({
       status: "connecting",
@@ -1364,6 +1400,7 @@ export function useVoiceAgent(args: {
     turnInFlightRef.current = false;
     pendingCloseRef.current = null;
     closingRef.current = false;
+    acceptCloseRef.current = false;
     if (closeTimerRef.current != null) {
       window.clearTimeout(closeTimerRef.current);
       closeTimerRef.current = null;
@@ -1426,6 +1463,7 @@ export function useVoiceAgent(args: {
     turnInFlightRef.current = false;
     pendingCloseRef.current = null;
     closingRef.current = false;
+    acceptCloseRef.current = false;
     abuseWarnedRef.current = false;
     if (closeTimerRef.current != null) {
       window.clearTimeout(closeTimerRef.current);
