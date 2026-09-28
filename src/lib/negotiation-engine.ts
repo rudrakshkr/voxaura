@@ -199,13 +199,27 @@ export interface EngineState {
 }
 
 export type RecruiterMove =
-  | { kind: "hold_firm"; final?: boolean }
+  | { kind: "hold_firm"; final?: boolean; close?: CloseOutcome }
   | { kind: "challenge_leverage" }
   | { kind: "counter"; package: CompPackage; conditions: string[] }
   | { kind: "trade"; package: CompPackage; conditions: string[]; gave: string; wants: string }
   | { kind: "accept"; package: CompPackage }
   | { kind: "probe"; question: string }
   | { kind: "recover_from_walkaway"; package: CompPackage; conditions: string[] };
+
+/** How a call ends when the recruiter has nothing left to give. */
+export type CloseOutcome = "walked_away" | "stalemate";
+
+/**
+ * The outcome a call should end with when this move is the recruiter's last
+ * word, or null when the negotiation can still continue. A `final` hold means
+ * the recruiter has no further room: the candidate must take what is on the
+ * table or the call is a deadlock — leaving it open just strands both sides.
+ */
+export function closingOutcome(move: RecruiterMove): CloseOutcome | null {
+  if (move.kind !== "hold_firm" || !move.final) return null;
+  return move.close ?? "stalemate";
+}
 
 export interface DecisionInput {
   hidden: HiddenState;
@@ -323,7 +337,9 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
           "Before you go — what's driving this? I'd hate for us to end on a misunderstanding.",
       };
     }
-    return { kind: "hold_firm", final: true };
+    // The candidate really is leaving and there is no recovery left: the call
+    // is over.
+    return { kind: "hold_firm", final: true, close: "walked_away" };
   }
 
   // 2. Acceptance: verify economics before agreeing.
@@ -360,7 +376,7 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
     if (!hasDetail || claim == null) {
       state.leverageChallenges += 1;
       // Two challenges is a conversation; a third identical one would be a loop.
-      if (state.leverageChallenges >= 3) return { kind: "hold_firm", final: true };
+      if (state.leverageChallenges >= 3) return { kind: "hold_firm", final: true, close: "stalemate" };
       return { kind: "challenge_leverage" };
     }
     const gap = Math.max(0, offerCap - curTotal);
@@ -399,7 +415,7 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
         if (moved.kind === "counter") return moved;
       }
       // No approval available: the standing package IS the answer.
-      return { kind: "hold_firm", final: true };
+      return { kind: "hold_firm", final: true, close: "stalemate" };
     }
     return { kind: "probe", question: informationAnswerQuestion(hidden, state) };
   }
@@ -433,7 +449,7 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
     }
 
     // The same number, a third time, with nothing new behind it.
-    if (state.repeatAskCount >= 2) return { kind: "hold_firm", final: true };
+    if (state.repeatAskCount >= 2) return { kind: "hold_firm", final: true, close: "stalemate" };
 
     if (!justified) {
       state.turnsWithoutUserMovement += 1;
@@ -504,7 +520,7 @@ function counterOrHold(
 ): RecruiterMove {
   const from = total(state.currentOffer);
   const pkg = bestSplit(hidden, state, from, Math.max(from, targetTotal));
-  if (total(pkg) - from < MIN_MOVE) return { kind: "hold_firm", final: true };
+  if (total(pkg) - from < MIN_MOVE) return { kind: "hold_firm", final: true, close: "stalemate" };
   state.turnsWithoutUserMovement = 0;
   return { kind: "counter", package: pkg, conditions };
 }

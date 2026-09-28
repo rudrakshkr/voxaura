@@ -153,13 +153,13 @@ export function ScenarioBuilder({ onCreated }: { onCreated: () => void | Promise
   }
 
   return (
-    <section className="card space-y-5">
+    <section className="card-solid space-y-5">
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2 className="font-semibold">Build a scenario</h2>
-          <p className="mt-1 text-sm text-white/50">
+          <p className="mt-1 text-sm text-white/65">
             Every field becomes a real constraint the opponent must respect. Leave anything on{" "}
-            <span className="text-white/70">Any</span> and the generator decides.
+            <span className="text-white/90">Any</span> and the generator decides.
           </p>
         </div>
         <button className="btn btn-ghost shrink-0" onClick={surprise} disabled={generating}>
@@ -236,7 +236,7 @@ export function ScenarioBuilder({ onCreated }: { onCreated: () => void | Promise
       </div>
 
       <div>
-        <p className="text-xs font-semibold uppercase tracking-wide text-white/40">
+        <p className="text-xs font-semibold uppercase tracking-wide text-white/55">
           Levers on the table
         </p>
         <div className="mt-2 flex flex-wrap gap-2">
@@ -250,8 +250,8 @@ export function ScenarioBuilder({ onCreated }: { onCreated: () => void | Promise
                 className={[
                   "rounded-full border px-3 py-1.5 text-xs transition",
                   on
-                    ? "border-violet-400/60 bg-violet-500/20 text-violet-100"
-                    : "border-white/15 text-white/60 hover:border-white/30",
+                    ? "border-violet-400/60 bg-violet-500/30 text-violet-50"
+                    : "border-white/15 bg-[#141926] text-white/70 hover:border-white/30",
                 ].join(" ")}
               >
                 {on ? "✓ " : ""}
@@ -260,7 +260,7 @@ export function ScenarioBuilder({ onCreated }: { onCreated: () => void | Promise
             );
           })}
         </div>
-        <p className="mt-2 text-xs text-white/35">
+        <p className="mt-2 text-xs text-white/50">
           Anything you pick gets a real, non-zero range in the opponent&apos;s hidden band.
         </p>
       </div>
@@ -277,8 +277,8 @@ export function ScenarioBuilder({ onCreated }: { onCreated: () => void | Promise
         </Field>
 
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-white/40">Difficulty</p>
-          <div className="mt-2 flex gap-1 rounded-xl border border-white/10 p-1">
+          <p className="text-xs font-semibold uppercase tracking-wide text-white/55">Difficulty</p>
+          <div className="mt-2 flex gap-1 rounded-xl border border-white/15 bg-[#141926] p-1">
             {(["easy", "medium", "hard"] as const).map((d) => (
               <button
                 key={d}
@@ -286,7 +286,7 @@ export function ScenarioBuilder({ onCreated }: { onCreated: () => void | Promise
                 onClick={() => setDifficulty(d)}
                 className={[
                   "rounded-lg px-3 py-1.5 text-xs capitalize transition",
-                  difficulty === d ? "bg-violet-500/30 text-white" : "text-white/50 hover:text-white/80",
+                  difficulty === d ? "bg-violet-500/40 text-white" : "text-white/65 hover:text-white",
                 ].join(" ")}
               >
                 {d}
@@ -329,9 +329,9 @@ function Field({
 }) {
   return (
     <label className="block">
-      <span className="text-xs font-semibold uppercase tracking-wide text-white/40">{label}</span>
+      <span className="text-xs font-semibold uppercase tracking-wide text-white/60">{label}</span>
       <div className="mt-1">{children}</div>
-      {hint && <span className="mt-1 block text-xs text-white/30">{hint}</span>}
+      {hint && <span className="mt-1 block text-xs text-white/45">{hint}</span>}
     </label>
   );
 }

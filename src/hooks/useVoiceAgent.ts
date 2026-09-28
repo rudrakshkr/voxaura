@@ -13,6 +13,7 @@ import type { BatchedEvent, CompPackage, TranscriptTurn } from "@/lib/types";
 import {
   extractSpokenPackage,
   transcriptSignature,
+  type CloseOutcome,
   type TurnDirective,
 } from "@/lib/negotiation-engine";
 
@@ -142,6 +143,12 @@ export interface VoiceAgentState {
   audioWarning: string | null;
   /** True when mic frames actually reached the call in the last ~1.5s. */
   audioFlowing: boolean;
+  /**
+   * Set when the engine declares the negotiation over with no deal — the call
+   * closes itself and the UI shows a "deal closed" banner rather than leaving
+   * the user on a dead line.
+   */
+  dealClosed: { outcome: CloseOutcome } | null;
 }
 
 export interface InlineAgentConfig {
@@ -229,6 +236,8 @@ const AGENT_SPEAKING_TIMEOUT_MS = 25_000;
 const TURN_WATCHDOG_MS = 1_500;
 /** Total engine attempts (across retries + watchdog re-queues) per utterance. */
 const MAX_TURN_ATTEMPTS = 4;
+/** Let the recruiter's closing line finish playing before we hang up. */
+const CLOSE_TAIL_MS = 2500;
 
 /** Reject a promise if it has not settled within `ms`. */
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -277,6 +286,7 @@ export function useVoiceAgent(args: {
     elapsedSec: 0,
     audioWarning: null,
     audioFlowing: false,
+    dealClosed: null,
   });
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -320,6 +330,14 @@ export function useVoiceAgent(args: {
   // When the current agent reply started — the watchdog reaps a reply that
   // never ended (missing reply.done) instead of staying deaf forever.
   const agentSpeakingAtRef = useRef(0);
+
+  // Closing the call on a deadlock: the engine flips `final` when the recruiter
+  // has no further room. A definite walk-away closes at once; a "no more room"
+  // hold only closes once the candidate pushes back again, so a real acceptance
+  // still gets its chance.
+  const pendingCloseRef = useRef<CloseOutcome | null>(null);
+  const finalHoldsRef = useRef(0);
+  const endRef = useRef<() => void>(() => {});
 
   // Duplicate-turn guards. A repeated finalisation used to print the recruiter's
   // sentence twice AND get re-parsed as a fresh offer, which is how the panel
@@ -658,7 +676,8 @@ export function useVoiceAgent(args: {
       turnInFlightRef.current = true;
       patch({ recruiterThinking: true });
       try {
-        let data: { directive: TurnDirective } | null = null;
+        let data: { directive: TurnDirective; final?: boolean; close?: CloseOutcome | null } | null =
+          null;
         // One retry: the relay must not die on a single dropped request — an
         // unbounded, unretried fetch is how the recruiter used to go deaf for
         // the rest of a call after one network blip.
@@ -673,7 +692,11 @@ export function useVoiceAgent(args: {
               TURN_FETCH_TIMEOUT_MS,
             );
             if (!res.ok) throw new Error(`turn ${res.status}`);
-            data = (await res.json()) as { directive: TurnDirective };
+            data = (await res.json()) as {
+              directive: TurnDirective;
+              final?: boolean;
+              close?: CloseOutcome | null;
+            };
           } catch (err) {
             if (attempt === 1) {
               console.error("[voice] engine turn failed after retry:", err);
@@ -684,6 +707,21 @@ export function useVoiceAgent(args: {
         if (!d) {
           patch({ recruiterThinking: false }); // nothing is coming; unspin the UI
           return false; // engine unreachable — the pump re-queues the utterance
+        }
+
+        // The engine tells us when the recruiter has nothing left to give. A
+        // clean walk-away ends the call at once; a "no more room" hold only ends
+        // it after the candidate pushes back a second time, so a genuine
+        // acceptance (which never comes back as `final`) still gets its chance.
+        if (data?.close === "walked_away") {
+          finalHoldsRef.current = 0;
+          pendingCloseRef.current = "walked_away";
+        } else if (data?.final) {
+          finalHoldsRef.current += 1;
+          if (finalHoldsRef.current >= 2) pendingCloseRef.current = "stalemate";
+        } else {
+          finalHoldsRef.current = 0;
+          pendingCloseRef.current = null;
         }
 
         const lines: string[] = [`SYSTEM DIRECTIVE (obey exactly): ${d.verdict}`];
@@ -1105,6 +1143,15 @@ export function useVoiceAgent(args: {
               pendingToolsRef.current = []; // agent moved on; drop stale results
             } else {
               flushPendingTools();
+              // The negotiation is over and the recruiter has finished saying
+              // so: close the call (after the closing line plays) instead of
+              // leaving the candidate on a dead line.
+              if (pendingCloseRef.current && !endedByUsRef.current) {
+                const outcome = pendingCloseRef.current;
+                pendingCloseRef.current = null;
+                patch({ dealClosed: { outcome } });
+                window.setTimeout(() => endRef.current(), CLOSE_TAIL_MS);
+              }
             }
             // Whatever the user said while the recruiter spoke gets its turn
             // now — and if a turn was somehow stuck, this unjams it.
@@ -1208,6 +1255,8 @@ export function useVoiceAgent(args: {
     pendingTurnsRef.current = []; // a fresh call starts with a clean relay
     agentSpeakingAtRef.current = 0;
     turnInFlightRef.current = false;
+    pendingCloseRef.current = null;
+    finalHoldsRef.current = 0;
     patch({
       status: "connecting",
       error: null,
@@ -1215,6 +1264,7 @@ export function useVoiceAgent(args: {
       audioFlowing: false,
       deferral: null,
       offerNotice: null,
+      dealClosed: null,
     });
     try {
       await connectInner(null);
@@ -1242,6 +1292,8 @@ export function useVoiceAgent(args: {
     pendingTurnsRef.current = []; // nothing queued may survive the call
     agentSpeakingAtRef.current = 0;
     turnInFlightRef.current = false;
+    pendingCloseRef.current = null;
+    finalHoldsRef.current = 0;
     patch({
       status: "ended",
       agentSpeaking: false,
@@ -1252,6 +1304,10 @@ export function useVoiceAgent(args: {
       offerNotice: null,
     });
   }, [flushEvents, mic, patch, playback, send]);
+
+  // The websocket handlers reach the hang-up through this ref so the close path
+  // does not depend on callback definition order (same trick as the turn pump).
+  endRef.current = end;
 
   /**
    * Replace the live socket with a brand-new session on the same attempt.
@@ -1288,10 +1344,13 @@ export function useVoiceAgent(args: {
       userSpeaking: false,
       justInterrupted: false,
       recruiterThinking: false,
+      dealClosed: null,
     });
     pendingTurnsRef.current = []; // restart = fresh relay
     agentSpeakingAtRef.current = 0;
     turnInFlightRef.current = false;
+    pendingCloseRef.current = null;
+    finalHoldsRef.current = 0;
     window.setTimeout(() => {
       void connectInner(null)
         .catch((err) => {

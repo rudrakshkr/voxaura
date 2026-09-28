@@ -81,6 +81,19 @@ export function VoiceSession(props: Props) {
     return () => window.clearTimeout(t);
   }, [accepted, complete, end]);
 
+  // The engine closes the call when the recruiter is done and no deal is
+  // possible. The socket is already down by then — score the attempt a beat
+  // after the banner lands, exactly like an accepted deal.
+  const dealClosed = state.dealClosed;
+  const closedOutcome = dealClosed?.outcome ?? null;
+  useEffect(() => {
+    if (!closedOutcome) return;
+    const t = window.setTimeout(() => {
+      void complete();
+    }, 6000);
+    return () => window.clearTimeout(t);
+  }, [closedOutcome, complete]);
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -128,6 +141,52 @@ export function VoiceSession(props: Props) {
         elapsedSec={state.elapsedSec}
         audioFlowing={state.audioFlowing}
       />
+
+      {/* The recruiter said they were done and no deal was reachable, so the
+          call closed itself. Say so plainly instead of leaving a silent line. */}
+      {dealClosed && (
+        <div
+          className={[
+            "rounded-xl border px-4 py-4",
+            dealClosed.outcome === "walked_away"
+              ? "border-rose-500/30 bg-rose-500/10"
+              : "border-slate-400/25 bg-white/[0.06]",
+          ].join(" ")}
+        >
+          <div className="flex items-start gap-3">
+            <span className="text-2xl leading-none">
+              {dealClosed.outcome === "walked_away" ? "🚪" : "🤝"}
+            </span>
+            <div className="min-w-0">
+              <p className="font-semibold text-white">
+                {dealClosed.outcome === "walked_away"
+                  ? "You walked away — the call is closed"
+                  : "No agreement — the call is closed"}
+              </p>
+              <p className="mt-1 text-sm text-white/65">
+                {dealClosed.outcome === "walked_away"
+                  ? "The negotiation ended without a deal. Your transcript is saved, and scoring shows exactly where it turned."
+                  : "The recruiter had no room left and was not going to meet your number, so the call closed rather than dragging on. Scoring will show what was achievable."}
+              </p>
+            </div>
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button className="btn btn-primary" onClick={() => void complete()} disabled={completing}>
+              {completing ? (
+                <>
+                  <Spinner /> Scoring…
+                </>
+              ) : (
+                "See your score"
+              )}
+            </button>
+            <Link href={`/scenario/${props.scenario.id}`} className="btn btn-ghost">
+              Back to prep
+            </Link>
+          </div>
+          {completeError && <p className="mt-2 text-sm text-red-300">{completeError}</p>}
+        </div>
+      )}
 
       {/* The call can look perfectly healthy while the agent receives no audio.
           Surface that the moment it's detected instead of letting the user
@@ -241,7 +300,7 @@ export function VoiceSession(props: Props) {
               </button>
             )}
 
-            {(state.status === "ended" || state.status === "error") && !completing && (
+            {(state.status === "ended" || state.status === "error") && !completing && !dealClosed && (
               <div className="space-y-2">
                 <button className="btn btn-primary w-full" onClick={() => void complete()}>
                   Score this attempt

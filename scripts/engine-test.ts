@@ -11,6 +11,7 @@ import {
   acceptanceTotalThreshold,
   acceptsPackage,
   classifyUserMove,
+  closingOutcome,
   decideRecruiterMove,
   dedupeTranscriptTurns,
   extractSpokenPackage,
@@ -365,6 +366,31 @@ console.log("\nP. Insisting on a yes is honoured; a lowball yes is not capitulat
   check("the recruiter improves slightly instead", r1.move.kind === "counter", `got ${r1.move.kind}`);
   const r2 = runTurn(state, "We have a deal at those terms.");
   check("a second yes closes the deal", r2.move.kind === "accept", `got ${r2.move.kind}`);
+}
+
+console.log("\nQ. A truly dead negotiation closes the call");
+{
+  // Closing signals drive the client to end the call instead of leaving the
+  // candidate on a dead line.
+  const state = freshState();
+  runTurn(state, "Hello, thanks for taking the time.");
+  const walk = runTurn(state, "I'm out — I'll walk away.");
+  check("a walk-away with no recovery left closes as walked_away", closingOutcome(walk.move) === "walked_away", `got ${closingOutcome(walk.move)}`);
+
+  const state2 = freshState();
+  const first = runTurn(state2, "I want 190000.");
+  check("a first, ordinary hold does not close the call", closingOutcome(first.move) === null, `got ${closingOutcome(first.move)}`);
+  runTurn(state2, "I want 190000.");
+  const third = runTurn(state2, "I want 190000.");
+  check("a repeated dead-end ask closes as stalemate", closingOutcome(third.move) === "stalemate", `got ${closingOutcome(third.move)}`);
+
+  const state3 = freshState();
+  const accept = (() => {
+    const r1 = runTurn(state3, "Okay, deal — I'll take what you offered.");
+    if (r1.move.kind === "accept") return r1.move;
+    return runTurn(state3, "We have a deal at those terms.").move;
+  })();
+  check("an acceptance never carries a close signal", closingOutcome(accept) === null, `got ${closingOutcome(accept)}`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

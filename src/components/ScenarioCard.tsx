@@ -181,13 +181,13 @@ export function ScenarioCard({
       {editing && (
         <Modal title="Edit scenario" onClose={() => setEditing(false)} wide>
           {/* Identity strip mirroring the card, so the modal feels anchored. */}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border border-violet-400/20 bg-violet-500/10 px-4 py-3">
+          <div className="surface flex flex-wrap items-center gap-x-4 gap-y-2 border-violet-400/20 bg-[#1f2340] px-4 py-3">
             <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/25 text-base">
               🎭
             </span>
             <div className="min-w-0 flex-1">
               <p className="truncate text-sm font-semibold">{draft.title || "Untitled scenario"}</p>
-              <p className="truncate text-xs text-white/45">
+              <p className="truncate text-xs text-white/60">
                 {draft.company || "Company"} · {draft.role || "Role"} · {draft.level || "Level"}
               </p>
             </div>
@@ -240,17 +240,17 @@ export function ScenarioCard({
             hint="Private to you — used on the prep screen and in scoring."
           >
             <div className="grid grid-cols-3 gap-2">
-              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+              <div className="surface-muted p-3">
                 <MoneyStat label="Target" value={draft.your_target} accent="text-violet-200" />
               </div>
-              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+              <div className="surface-muted p-3">
                 <MoneyStat
                   label="Walk away below"
                   value={draft.your_reservation}
                   accent="text-rose-200"
                 />
               </div>
-              <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3">
+              <div className="surface-muted p-3">
                 <MoneyStat
                   label="Stretch gap"
                   value={Math.max(0, draft.your_target - draft.your_reservation)}
@@ -291,7 +291,7 @@ export function ScenarioCard({
             hint="How hard the recruiter fights, and what the offer is made of."
           >
             <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-white/40">
+              <p className="text-xs font-semibold uppercase tracking-wide text-white/55">
                 Difficulty
               </p>
               <div className="mt-2 grid grid-cols-3 gap-2">
@@ -306,8 +306,8 @@ export function ScenarioCard({
                       className={[
                         "rounded-xl border px-3 py-2.5 text-left transition",
                         on
-                          ? "border-violet-400/60 bg-violet-500/20"
-                          : "border-white/10 hover:border-white/25",
+                          ? "border-violet-400/60 bg-violet-500/25"
+                          : "border-white/15 bg-[#141926] hover:border-white/30",
                       ].join(" ")}
                     >
                       <span className="text-base">{icon}</span>
@@ -337,7 +337,7 @@ export function ScenarioCard({
             </Field>
           </EditSection>
 
-          <p className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-xs text-white/35">
+          <p className="surface-muted px-3 py-2 text-xs text-white/55">
             🔒 The recruiter&apos;s budget, floor and target are not editable here — they never
             leave the server, which is what keeps the scenario honest.
           </p>
@@ -370,9 +370,9 @@ function Modal({
   wide?: boolean;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-4 py-10">
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/80 p-4 py-10 backdrop-blur-sm">
       <div
-        className={["card w-full space-y-3", wide ? "max-w-2xl" : "max-w-md"].join(" ")}
+        className={["card-solid w-full space-y-3", wide ? "max-w-2xl" : "max-w-md"].join(" ")}
       >
         <div className="flex items-center justify-between">
           <h3 className="font-semibold">{title}</h3>
@@ -399,9 +399,9 @@ function Field({
 }) {
   return (
     <label className={["block", className ?? ""].join(" ")}>
-      <span className="text-xs font-semibold uppercase tracking-wide text-white/40">{label}</span>
+      <span className="text-xs font-semibold uppercase tracking-wide text-white/60">{label}</span>
       <div className="mt-1">{children}</div>
-      {hint && <span className="mt-1 block text-xs text-white/30">{hint}</span>}
+      {hint && <span className="mt-1 block text-xs text-white/45">{hint}</span>}
     </label>
   );
 }
@@ -419,14 +419,14 @@ function EditSection({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+    <section className="surface p-4">
       <div className="mb-3 flex items-center gap-3">
-        <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-violet-500/25 text-xs font-bold text-violet-200">
+        <span className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-violet-500/30 text-xs font-bold text-violet-100">
           {step}
         </span>
         <div className="min-w-0">
           <h4 className="text-sm font-semibold">{title}</h4>
-          {hint && <p className="truncate text-xs text-white/35">{hint}</p>}
+          {hint && <p className="truncate text-xs text-white/50">{hint}</p>}
         </div>
       </div>
       {children}
@@ -445,7 +445,7 @@ function MoneyStat({
 }) {
   return (
     <>
-      <p className="text-[10px] font-semibold uppercase tracking-wide text-white/35">{label}</p>
+      <p className="text-[10px] font-semibold uppercase tracking-wide text-white/50">{label}</p>
       <p className={["mt-0.5 text-sm font-semibold tabular-nums", accent].join(" ")}>
         {value.toLocaleString("en-US", {
           style: "currency",

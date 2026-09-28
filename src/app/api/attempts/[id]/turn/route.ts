@@ -12,6 +12,7 @@ import {
 import {
   buildDirective,
   classifyUserMove,
+  closingOutcome,
   decideRecruiterMove,
 } from "@/lib/negotiation-engine";
 import { getAttemptWithScenario, insertEvents } from "@/lib/db/queries";
@@ -149,6 +150,16 @@ export const POST = handle(
       standingOffer: state.currentOffer,
       round: state.round,
     });
-    return Response.json({ directive, verdict: engineVerdict });
+    // `final` marks the recruiter's definitive last word, and `close` names the
+    // outcome the call should end with when the negotiation truly cannot
+    // continue (the candidate walked, or the numbers are definitively dead).
+    // The client uses these to end the call instead of leaving it hanging.
+    const close = closingOutcome(move);
+    return Response.json({
+      directive,
+      verdict: engineVerdict,
+      final: move.kind === "hold_firm" && move.final === true,
+      close,
+    });
   },
 );

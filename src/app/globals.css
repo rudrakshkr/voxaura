@@ -18,6 +18,34 @@ body {
   padding: 24px;
 }
 
+/*
+ * Opaque surfaces. A translucent panel over a busy page background let the
+ * content behind it bleed through, which made forms (especially the scenario
+ * edit modal) genuinely hard to read. Anything the user reads and types into
+ * gets a solid backdrop instead.
+ */
+.card-solid {
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: #161a26;
+  box-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.8);
+  padding: 24px;
+}
+
+/* Nested panel for a group of fields (opaque, one step lighter than its card). */
+.surface {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: #1c2130;
+}
+
+/* Small opaque readout / callout inside a form. */
+.surface-muted {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: #191e2b;
+}
+
 .btn {
   display: inline-flex;
   align-items: center;
@@ -61,14 +89,18 @@ body {
 .input {
   width: 100%;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: #0e1119;
   padding: 10px 14px;
   color: var(--foreground);
   outline: none;
 }
+.input::placeholder {
+  color: rgba(231, 234, 240, 0.35);
+}
 .input:focus {
   border-color: #6d5bff;
+  box-shadow: 0 0 0 3px rgba(109, 91, 255, 0.25);
 }
 
 .badge {
