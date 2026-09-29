@@ -635,8 +635,17 @@ export function useVoiceAgent(args: {
   const armAcceptClose = useCallback(() => {
     if (acceptCloseRef.current || endedByUsRef.current) return;
     acceptCloseRef.current = true;
+    // A close already armed for a deadlock or a walk-away is superseded: the
+    // deal won, so the banner and the reason have to say so. (Without this the
+    // accept lands while `closingRef` is still set, `closeCall` early-returns,
+    // and the caller is told the negotiation failed.)
+    if (closingRef.current) {
+      stopClosePoll();
+      closingRef.current = false;
+      patch({ dealClosed: null });
+    }
     closeCallRef.current("accepted");
-  }, []);
+  }, [patch, stopClosePoll]);
   const armAcceptCloseRef = useRef(armAcceptClose);
   armAcceptCloseRef.current = armAcceptClose;
 
@@ -1009,6 +1018,12 @@ export function useVoiceAgent(args: {
           if (res?.accepted) {
             patch({ acceptedOffer: res.offer ?? offer, offerNotice: null });
             armAcceptCloseRef.current();
+          } else if (stateRef.current.acceptedOffer) {
+            // The engine already settled this deal on an earlier turn and the
+            // panel says so. A refused or mismatched echo of the tool call can
+            // never UN-agree it — dropping the accepted package and showing
+            // "not validated" here is exactly what made a real deal look
+            // rejected.
           } else {
             patch({
               acceptedOffer: null,
@@ -1112,6 +1127,14 @@ export function useVoiceAgent(args: {
   /** Dispatch every queued turn, newest last; safe to call from anywhere. */
   const pumpTurnQueue = useCallback(() => {
     if (turnInFlightRef.current) return;
+    if (acceptCloseRef.current) {
+      // The deal is agreed: `/turn` has already closed the attempt, so a later
+      // utterance would only be refused (409) and retried in a loop. The
+      // sentence still reaches the transcript; there is simply nothing left to
+      // negotiate.
+      pendingTurnsRef.current = [];
+      return;
+    }
     const queue = pendingTurnsRef.current;
     if (queue.length === 0) return;
     pendingTurnsRef.current = [];
@@ -1202,6 +1225,19 @@ export function useVoiceAgent(args: {
         // tool call that follows presents it, so a browser cannot invent an
         // offer or an acceptance. A turn that authorizes nothing clears it.
         latestAuthRef.current = data?.authorization ?? null;
+
+        // The ENGINE settled the deal on this turn: the server had already
+        // recorded the acceptance and closed the attempt before this response
+        // was written. So the panel and the hang-up follow THAT, not the
+        // recruiter's model. The `accept_user_offer` tool call below is only a
+        // confirmation of something already decided — it can be skipped,
+        // delayed, or echo different figures, and the deal is agreed either
+        // way. Driving the banner off the tool result is why "Deal accepted"
+        // and the close stopped appearing on live calls.
+        if (data?.authorization?.action === "accept" && data.authorization.package) {
+          patch({ acceptedOffer: data.authorization.package, offerNotice: null });
+          armAcceptCloseRef.current();
+        }
 
         const lines: string[] = [`SYSTEM DIRECTIVE (obey exactly): ${d.verdict}`];
         // The on-table package travels with every directive: the model restates

@@ -11,7 +11,6 @@ import {
   consumeAuthorizationTx,
   insertEventsTx,
   loadAttemptWithScenarioTx,
-  samePackage,
   setAttemptEngineStateTx,
   setAttemptOutcomeIfAcceptedTx,
   withAttemptLock,
@@ -144,7 +143,14 @@ export const POST = handle(
           attempt.status === "completed" &&
           attempt.outcome === "accepted" &&
           attempt.final_offer != null;
-        if (alreadyAgreed && requestedAccept && samePackage(attempt.final_offer!, requestedAccept)) {
+        if (alreadyAgreed && requestedAccept) {
+          // The deal is settled, so this is a CONFIRMATION, not a request: the
+          // figures in the reply come from the row, never from the request, and
+          // nothing is mutated. Requiring an exact match used to 409 here when
+          // the recruiter's model echoed `accept_user_offer` with a rounded or
+          // partially-stated package, which surfaced "the engine did not
+          // validate that agreement" on a deal that HAD been agreed — and
+          // cleared the accepted banner on the client with it.
           return {
             offer: attempt.final_offer!,
             changed: false,

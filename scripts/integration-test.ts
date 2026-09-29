@@ -68,6 +68,17 @@ function check(name: string, cond: boolean, detail = "") {
 const OWNER_A = "a".repeat(48);
 const OWNER_B = "b".repeat(48);
 
+/**
+ * Per-run suffix for the session ids this suite binds.
+ *
+ * `attempts.session_id` is unique (migration 0005: one session belongs to one
+ * attempt), so a run that is killed before its cleanup leaves ids behind and
+ * every LATER run fails at bind time with a duplicate-key error. The assertions
+ * stay on fixed, readable values while the rows themselves are unique per run.
+ */
+const RUN = Date.now().toString(36);
+const sess = (name: string) => `${name}-${RUN}`;
+
 const BAND: HiddenState = {
   budget: 180_000,
   reservation: 150_000,
@@ -411,13 +422,14 @@ async function dbTests() {
   console.log("\nA10. Session binding and the delete guard, against real rows");
   const sessionAttempt = await newAttempt(scnA.id, OWNER_A);
   await newAttempt(scnA.id, OWNER_A);
+  const boundSession = sess("sess-integration-1");
   await withAttemptLock(sessionAttempt, (tx) =>
-    bindAttemptSessionTx(tx, sessionAttempt, "sess-integration-1"),
+    bindAttemptSessionTx(tx, sessionAttempt, boundSession),
   );
-  check("an attempt records the session it is bound to", (await getAttempt(sessionAttempt)).session_id === "sess-integration-1");
+  check("an attempt records the session it is bound to", (await getAttempt(sessionAttempt)).session_id === boundSession);
   check(
     "and the session can be attributed back to it",
-    (await findAttemptIdBySession("sess-integration-1")) === sessionAttempt,
+    (await findAttemptIdBySession(boundSession)) === sessionAttempt,
   );
   check(
     "live attempts are counted so a scenario under call cannot be deleted",
@@ -766,6 +778,46 @@ async function httpTests() {
     check("with the agreed figures, not the refused ones", settled.final_offer?.base === acceptAuth?.package.base);
     check("the recorded deal is inside the band", settled.final_offer != null && withinPackageLimits(BAND, settled.final_offer));
 
+    // The client arms its "Deal agreed" banner from the TURN response (the
+    // server settled the deal there); the recruiter's tool call is only a
+    // confirmation. A confirmation that echoes the figures differently — which
+    // is what a rounding model actually does — must be answered as agreed, with
+    // the authoritative package, instead of 409-ing into a "not validated"
+    // notice on a deal that was in fact agreed.
+    const echoedOff = await api(`/api/attempts/${capId}/offer`, {
+      method: "POST",
+      body: { accept_candidate_package: { base: 0, sign_on: 0, equity: 0 } },
+      as: "A",
+    });
+    check(
+      "a settled deal is still confirmed when the echo names different figures",
+      echoedOff.status === 200 && echoedOff.json.accepted === true,
+      `status=${echoedOff.status} ${JSON.stringify(echoedOff.json)}`,
+    );
+    check(
+      "and the reply carries the AGREED package, not the echoed one",
+      (echoedOff.json.offer as { base: number } | null)?.base === settled.final_offer?.base,
+      JSON.stringify(echoedOff.json.offer),
+    );
+    const afterEcho = (await api(`/api/attempts/${capId}`, { as: "A" })).json.attempt as {
+      status: string;
+      outcome: string | null;
+      final_offer: { base: number } | null;
+    };
+    check(
+      "a confirmation never mutates the settled deal",
+      afterEcho.status === "completed" &&
+        afterEcho.outcome === "accepted" &&
+        afterEcho.final_offer?.base === settled.final_offer?.base,
+      JSON.stringify(afterEcho),
+    );
+    const lateTurn = await api(`/api/attempts/${capId}/turn`, {
+      method: "POST",
+      body: { user_text: "One more thing about the start date.", turn_id: "late-after-deal" },
+      as: "A",
+    });
+    check("and the closed attempt refuses further negotiation", lateTurn.status === 409, `status=${lateTurn.status}`);
+
     // Completion after the engine already settled the deal must not re-label it.
     const completeAfter = await api(`/api/attempts/${capId}/complete`, {
       method: "POST",
@@ -1104,7 +1156,7 @@ async function httpTests() {
     if (s1Id) createdAttemptIds.push(s1Id);
     const firstBind = await api(`/api/attempts/${s1Id}/session`, {
       method: "POST",
-      body: { session_id: "http-sess-1" },
+      body: { session_id: sess("http-sess-1") },
       as: sJar,
     });
     check(
@@ -1114,19 +1166,19 @@ async function httpTests() {
     );
     const sameBind = await api(`/api/attempts/${s1Id}/session`, {
       method: "POST",
-      body: { session_id: "http-sess-1" },
+      body: { session_id: sess("http-sess-1") },
       as: sJar,
     });
     check("rebinding the SAME session is idempotent", sameBind.status === 200 && sameBind.json.bound === false);
     const silentSwap = await api(`/api/attempts/${s1Id}/session`, {
       method: "POST",
-      body: { session_id: "http-sess-2" },
+      body: { session_id: sess("http-sess-2") },
       as: sJar,
     });
     check("a conflicting session is rejected", silentSwap.status === 409, String(silentSwap.status));
     const deliberate = await api(`/api/attempts/${s1Id}/session`, {
       method: "POST",
-      body: { session_id: "http-sess-2", previous_session_id: "http-sess-1" },
+      body: { session_id: sess("http-sess-2"), previous_session_id: sess("http-sess-1") },
       as: sJar,
     });
     check(
@@ -1136,11 +1188,11 @@ async function httpTests() {
     );
     check(
       "a foreign owner cannot bind the attempt's session",
-      (await api(`/api/attempts/${s1Id}/session`, { method: "POST", body: { session_id: "http-sess-3" }, as: "B" })).status === 404,
+      (await api(`/api/attempts/${s1Id}/session`, { method: "POST", body: { session_id: sess("http-sess-3") }, as: "B" })).status === 404,
     );
     const eventSwap = await api(`/api/attempts/${s1Id}/events`, {
       method: "POST",
-      body: { session_id: "http-sess-9", events: [{ type: "rapport", actor: "user", source: "tool", payload: {} }] },
+      body: { session_id: sess("http-sess-9"), events: [{ type: "rapport", actor: "user", source: "tool", payload: {} }] },
       as: sJar,
     });
     check("an events batch cannot swap the session", eventSwap.status === 409, String(eventSwap.status));
@@ -1149,7 +1201,7 @@ async function httpTests() {
     if (s2Id) createdAttemptIds.push(s2Id);
     const steal = await api(`/api/attempts/${s2Id}/session`, {
       method: "POST",
-      body: { session_id: "http-sess-2" },
+      body: { session_id: sess("http-sess-2") },
       as: sJar,
     });
     check(
@@ -1159,7 +1211,7 @@ async function httpTests() {
     );
     const substituted = await api(`/api/attempts/${s1Id}/complete`, {
       method: "POST",
-      body: { session_id: "http-sess-77", transcript: [{ role: "user", text: "hello" }] },
+      body: { session_id: sess("http-sess-77"), transcript: [{ role: "user", text: "hello" }] },
       as: sJar,
     });
     check(
