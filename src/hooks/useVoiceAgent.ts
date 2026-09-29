@@ -9,6 +9,7 @@ import {
   type ClientMsg,
   type VoiceAgentEvent,
 } from "@/lib/voice/protocol";
+import { MAX_EVENTS_PER_REQUEST } from "@/lib/types";
 import type { BatchedEvent, CompPackage, TranscriptTurn } from "@/lib/types";
 import {
   detectHostileLanguage,
@@ -17,6 +18,12 @@ import {
   type CloseOutcome,
   type TurnDirective,
 } from "@/lib/negotiation-engine";
+import {
+  DirectiveRelay,
+  type RelayedDirective,
+  drainEventQueue,
+  resolveAttemptStartedAt,
+} from "@/lib/voice/relay";
 
 /**
  * Client-handled function tools for the AssemblyAI voice agent.
@@ -155,6 +162,13 @@ export interface VoiceAgentState {
    * offence ends the call — respect is not part of the negotiation.
    */
   abuseWarning: boolean;
+  /**
+   * Durable-event sync health, surfaced in the session status strip. Events are
+   * batched client-side and flushed to Postgres; a failed flush keeps them
+   * queued and retries, so nothing is silently lost mid-demo and the user can
+   * see that state is still being recorded.
+   */
+  sync: { pending: number; recorded: number; state: "idle" | "syncing" | "error" };
 }
 
 /** Why the client hung up: an agreed deal, an engine-declared deadlock, or abuse. */
@@ -258,24 +272,114 @@ const CLOSE_POLL_MS = 250;
 /** Absolute ceiling on waiting, so a wedged reply can never strand the call. */
 const CLOSE_MAX_WAIT_MS = 20_000;
 
-/** Reject a promise if it has not settled within `ms`. */
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const t = window.setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
-    p.then(
-      (v) => {
-        window.clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        window.clearTimeout(t);
-        reject(e);
-      },
-    );
-  });
+/**
+ * `fetch` with a real deadline.
+ *
+ * Rejecting a promise does not stop the request behind it: without an abort the
+ * abandoned call keeps running, and a retry then races a request that is still
+ * in flight. The controller cancels it, and the caller retries under the SAME
+ * turn id so the server can replay instead of negotiating twice.
+ */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  ms: number,
+): Promise<Response> {
+  const ctl = new AbortController();
+  const timer = window.setTimeout(() => ctl.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: ctl.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
 }
+
+/**
+ * Refresh resilience.
+ *
+ * The engine's negotiation state lives server-side and survives a reload on its
+ * own, but two things do not: the browser's transcript buffer and the voice
+ * session identity. Losing them means a mid-call refresh restarts the
+ * conversation from scratch — and, worse, a NEW AssemblyAI session id replaces
+ * the recorded one, so the server-side transcript fallback can only recover the
+ * part of the call that happened after the reload.
+ *
+ * Both are therefore mirrored into `sessionStorage` (per attempt, cleared when
+ * the call ends), which is exactly the lifetime we want: surviving a reload,
+ * gone when the tab closes.
+ */
+const MAX_PERSISTED_TURNS = 300;
+const sessionKey = (attemptId: string) => `voxaura:session:${attemptId}`;
+const transcriptKey = (attemptId: string) => `voxaura:transcript:${attemptId}`;
+const directiveKey = (attemptId: string) => `voxaura:directives:${attemptId}`;
+
+function storageGet(key: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.sessionStorage.getItem(key);
+  } catch {
+    return null; // private mode / disabled storage
+  }
+}
+
+function storageSet(key: string, value: string | null): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (value == null) window.sessionStorage.removeItem(key);
+    else window.sessionStorage.setItem(key, value);
+  } catch {
+    // Best-effort: persistence must never break a live call.
+  }
+}
+
+function loadPersistedTranscript(attemptId: string): TranscriptTurn[] {
+  const raw = storageGet(transcriptKey(attemptId));
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as TranscriptTurn[];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((t) => t && typeof t.text === "string" && (t.role === "user" || t.role === "agent"))
+      .slice(-MAX_PERSISTED_TURNS);
+  } catch {
+    return [];
+  }
+}
+
+function loadPersistedSession(attemptId: string): string | null {
+  return storageGet(sessionKey(attemptId));
+}
+
+function loadPersistedDirectives(attemptId: string): RelayedDirective[] {
+  const raw = storageGet(directiveKey(attemptId));
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (d): d is RelayedDirective =>
+        Boolean(d) &&
+        typeof d === "object" &&
+        typeof (d as { key?: unknown }).key === "string" &&
+        typeof (d as { content?: unknown }).content === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * A per-utterance idempotency key. Stable across the retries of ONE utterance, so
+ * a timeout-then-retry pair is processed exactly once. `randomUUID` needs a
+ * secure context; the fallback keeps local (non-HTTPS, non-localhost) runs alive.
+ */
+function newTurnId(): string {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 const SETUP_TIMEOUT_MS = 15_000; // token + WS + session.ready must land within this
-const MIC_READY_TIMEOUT_MS = 10_000; // first-time mic permission can be slow, not infinite
 const GREETING_TIMEOUT_MS = 12_000; // ready but no recruiter audio => setup is wedged
 
 export function useVoiceAgent(args: {
@@ -285,12 +389,22 @@ export function useVoiceAgent(args: {
   inlineConfig?: InlineAgentConfig | null;
   /** Server-derived standing package, so the panel is never empty at call start. */
   initialOffer?: CompPackage | null;
+  /**
+   * When the ATTEMPT started, from the server (`attempt.started_at`).
+   *
+   * The elapsed clock and every event timestamp are relative to this rather than
+   * to the moment the socket last became ready, so a reconnect cannot reset the
+   * timer and quietly extend the call past its maximum.
+   */
+  startedAtMs?: number | null;
 }) {
   const [state, setState] = useState<VoiceAgentState>({
     status: "idle",
     error: null,
     sessionId: null,
-    transcript: [],
+    // Restored from sessionStorage: a reload mid-call keeps what was said, and
+    // the report scores the whole conversation instead of the post-reload half.
+    transcript: loadPersistedTranscript(args.attemptId),
     partialUser: null,
     userSpeaking: false,
     agentSpeaking: false,
@@ -307,12 +421,18 @@ export function useVoiceAgent(args: {
     audioFlowing: false,
     dealClosed: null,
     abuseWarning: false,
+    sync: { pending: 0, recorded: 0, state: "idle" },
   });
 
   const wsRef = useRef<WebSocket | null>(null);
   const statusRef = useRef<AgentStatus>("idle");
-  const sessionIdRef = useRef<string | null>(null);
-  const startedAtRef = useRef<number | null>(null);
+  // Restored so a reload resumes the SAME voice session rather than replacing
+  // it — which also keeps the server-side session timeline complete.
+  const sessionIdRef = useRef<string | null>(loadPersistedSession(args.attemptId));
+  // Seeded from the attempt's server-side start time. A reconnect does NOT
+  // re-stamp it (see `session.ready`), so a dropped socket cannot hand the caller
+  // a fresh ten minutes.
+  const startedAtRef = useRef<number | null>(args.startedAtMs ?? null);
   const endedByUsRef = useRef(false);
   const resumedOnceRef = useRef(false);
   const connectingRef = useRef(false);
@@ -338,6 +458,24 @@ export function useVoiceAgent(args: {
 
   // Event batch queue for the attempts API.
   const eventQueueRef = useRef<BatchedEvent[]>([]);
+  /** Events confirmed inserted by the server — shown in the session status. */
+  const recordedEventsRef = useRef(0);
+
+  // Engine directives that were ready but could not be written to the socket.
+  //
+  // `send()` silently did nothing when the websocket was not open, so a
+  // successful `/turn` whose recruiter directive arrived during a blip lost that
+  // directive FOREVER: the engine had decided, the browser had the answer, and
+  // the recruiter simply never heard it. Directives are now queued by turn id
+  // and delivered after the session reconnects — re-running `/turn` would be
+  // wrong (the state has already moved) and sending twice would make the
+  // recruiter repeat itself.
+  const directiveRelayRef = useRef(new DirectiveRelay(loadPersistedDirectives(args.attemptId)));
+  // Authorization issued by the most recent `/turn`, presented to `/offer` so the
+  // server can tell a real recruiter action from a forged request.
+  const latestAuthRef = useRef<{ token: string; action: "offer" | "accept"; package: CompPackage } | null>(
+    null,
+  );
 
   // Turn relay: user utterances queue here until their engine directive has
   // been dispatched. A QUEUE, never a slot — an utterance the engine has not
@@ -536,29 +674,152 @@ export function useVoiceAgent(args: {
     [],
   );
 
-  const queueEvent = useCallback((e: BatchedEvent) => {
-    eventQueueRef.current.push(e);
-    if (eventQueueRef.current.length >= 10) {
-      void flushEvents();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const flushEvents = useCallback(async () => {
-    const events = eventQueueRef.current;
-    if (events.length === 0) return;
-    eventQueueRef.current = [];
-    try {
-      await fetch(`/api/attempts/${argsRef.current.attemptId}/events`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionIdRef.current, events }),
+  const queueEvent = useCallback(
+    (e: BatchedEvent) => {
+      eventQueueRef.current.push(e);
+      patch({
+        sync: {
+          pending: eventQueueRef.current.length,
+          recorded: recordedEventsRef.current,
+          state: "idle",
+        },
       });
-    } catch {
-      // Non-fatal: the scorer re-extracts events from the transcript.
-      eventQueueRef.current.unshift(...events);
-    }
-  }, []);
+      if (eventQueueRef.current.length >= 10) {
+        void flushEventsRef.current();
+      }
+    },
+    [patch],
+  );
+
+  /**
+   * Flush queued events to the durable log.
+   *
+   * `await fetch(...)` resolving is NOT success — a 500 resolves too. The status
+   * code is checked explicitly, failed batches are put back at the front of the
+   * queue, and a retry is scheduled, so a mid-demo network blip delays the log
+   * instead of silently dropping the negotiation history.
+   *
+   * Two things the naive whole-queue POST got wrong:
+   *  - SIZE. The server accepts at most MAX_EVENTS_PER_REQUEST events. A long
+   *    network outage lets the queue grow past that, and then every flush is
+   *    answered with a 400 — forever, with each retry re-appending the same
+   *    oversized batch, so the log silently stops growing mid-call. The queue is
+   *    therefore drained in chunks the server will actually accept.
+   *  - PERMANENCE. Retrying is only right while an error could be transient. A
+   *    4xx (other than the two that explicitly mean "later") is the server
+   *    refusing THIS payload — a retry loop can never succeed, blocks every
+   *    event queued behind it, and hammers the API for the life of the tab.
+   */
+  const flushEvents = useCallback(
+    async (opts?: {
+      /**
+       * Final flush before scoring: retry transient failures only until a bounded
+       * deadline, and report whether the log is complete rather than assuming it.
+       */
+      final?: boolean;
+      deadlineMs?: number;
+    }): Promise<{ ok: boolean; pending: number }> => {
+      const events = eventQueueRef.current;
+      if (events.length === 0) {
+        if (stateRef.current.sync.state !== "idle") {
+          patch({
+            sync: {
+              pending: 0,
+              recorded: recordedEventsRef.current,
+              state: "idle",
+            },
+          });
+        }
+        return { ok: true, pending: 0 };
+      }
+      // Claim the whole queue before the first await: a second concurrent flush
+      // then sees an empty queue instead of re-sending what this one already has.
+      eventQueueRef.current = [];
+      patch({
+        sync: { pending: events.length, recorded: recordedEventsRef.current, state: "syncing" },
+      });
+
+      const batches: BatchedEvent[][] = [];
+      for (let i = 0; i < events.length; i += MAX_EVENTS_PER_REQUEST) {
+        batches.push(events.slice(i, i + MAX_EVENTS_PER_REQUEST));
+      }
+
+      // The retry/deadline policy lives in lib/voice/relay.ts so it can be tested
+      // without a browser: transient failures are retried only within the final
+      // flush's budget, a permanent refusal drops that chunk instead of wedging
+      // every later event behind it, and the result says plainly whether the log
+      // is complete.
+      // Tracked locally rather than read off the drain result: `post` runs while
+      // the call is still in flight, so the result object does not exist yet.
+      let deliveredSoFar = 0;
+      const result = await drainEventQueue({
+        batches,
+        deadlineAt: opts?.final ? Date.now() + (opts.deadlineMs ?? 3_000) : null,
+        retryDelayMs: 250,
+        sleep: (ms) => new Promise((r) => window.setTimeout(r, ms)),
+        post: async (batch) => {
+          try {
+            const res = await fetch(`/api/attempts/${argsRef.current.attemptId}/events`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ session_id: sessionIdRef.current, events: batch }),
+            });
+            if (!res.ok) {
+              const permanent =
+                res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
+              if (permanent) {
+                console.error(
+                  `[voice] server refused ${batch.length} event(s) (${res.status}); dropping that batch`,
+                );
+                return "permanent";
+              }
+              return "transient";
+            }
+            const data = (await res.json().catch(() => ({}))) as { inserted?: number };
+            recordedEventsRef.current += data.inserted ?? batch.length;
+            deliveredSoFar += batch.length;
+            patch({
+              sync: {
+                pending: Math.max(0, events.length - deliveredSoFar),
+                recorded: recordedEventsRef.current,
+                state: "syncing",
+              },
+            });
+            return "ok";
+          } catch {
+            return "transient";
+          }
+        },
+      });
+
+      if (result.incompleteItems > 0) {
+        // Put back exactly what was never delivered, ahead of anything queued
+        // since, and (for the periodic flush) retry shortly.
+        eventQueueRef.current.unshift(...events.slice(events.length - result.incompleteItems));
+        patch({
+          sync: {
+            pending: eventQueueRef.current.length,
+            recorded: recordedEventsRef.current,
+            state: "error",
+          },
+        });
+        if (!opts?.final) window.setTimeout(() => void flushEventsRef.current(), 2500);
+        return { ok: false, pending: eventQueueRef.current.length };
+      }
+
+      patch({
+        sync: {
+          pending: eventQueueRef.current.length,
+          recorded: recordedEventsRef.current,
+          state: result.droppedItems > 0 ? "error" : "idle",
+        },
+      });
+      return { ok: result.ok, pending: eventQueueRef.current.length };
+    },
+    [patch],
+  );
+  const flushEventsRef = useRef(flushEvents);
+  flushEventsRef.current = flushEvents;
 
   // ---------------------------------------------------------------------------
   // Spoken-offer reconciliation
@@ -578,8 +839,18 @@ export function useVoiceAgent(args: {
         agentText?: string;
         pkg?: CompPackage;
         conditions?: string[] | null;
-        /** The recruiter agreed: record the deal, don't just note the numbers. */
-        accepted?: boolean;
+        /**
+         * The recruiter agreed to the candidate's package. This is a REQUEST:
+         * the server re-evaluates it against the authoritative economics and
+         * only records a deal when the engine agrees.
+         */
+        acceptPackage?: CompPackage;
+        /**
+         * The single-use token `/turn` issued for this exact action. Without it
+         * the server records the speech as an observation and changes no
+         * economics — the browser cannot make a recruiter action real.
+         */
+        authorizationToken?: string;
       },
       atMs: number | null,
     ) => {
@@ -591,7 +862,8 @@ export function useVoiceAgent(args: {
             agent_text: input.agentText,
             package: input.pkg,
             conditions: input.conditions?.length ? input.conditions : undefined,
-            accepted: input.accepted || undefined,
+            accept_candidate_package: input.acceptPackage,
+            authorization_token: input.authorizationToken,
             at_ms: atMs,
           }),
         });
@@ -599,9 +871,15 @@ export function useVoiceAgent(args: {
         const data = (await res.json()) as {
           offer: CompPackage;
           changed: boolean;
-          adjusted: boolean;
+          /** The engine state changed AND this request was authorized for it. */
+          authoritative?: boolean;
+          /** The recruiter said something that is not on the table. */
+          correction?: boolean;
           notice: string | null;
           conditions: string[] | null;
+          /** True only when the ENGINE validated the agreement. */
+          accepted?: boolean;
+          accept_reason?: string | null;
           deferral?: { outstanding: boolean; deferredNow: boolean; quote: string | null };
         };
 
@@ -610,6 +888,16 @@ export function useVoiceAgent(args: {
         // engine state now holds, so later FACT lines quote the same figures.
         if (data.changed && data.offer) {
           setOffer(data.offer, data.conditions?.length ? data.conditions : undefined);
+        } else if (data.correction && data.offer) {
+          // An unauthorized spoken figure was recorded as an inconsistency. The
+          // panel must not keep showing a number that is not on the table.
+          setOffer(data.offer);
+        }
+        if (data.notice) patch({ offerNotice: data.notice });
+        if (data.accepted) patch({ offerNotice: null });
+        if (data.authoritative && input.authorizationToken) {
+          // The token is spent; never present it again.
+          if (latestAuthRef.current?.token === input.authorizationToken) latestAuthRef.current = null;
         }
 
         const outstanding = Boolean(data.deferral?.outstanding);
@@ -681,14 +969,18 @@ export function useVoiceAgent(args: {
         // then mirrors the same figures into the engine state so the next
         // directive's FACT line quotes them.
         setOffer(offer, conditions);
-        void reconcileOffer({ pkg: offer, conditions }, elapsedMs());
-        queueEvent({
-          type: "opponent_offer",
-          actor: "opponent",
-          source: "tool",
-          payload: { package: offer, note: args.notes ?? null },
-          at_ms: elapsedMs(),
-        });
+        // The server records the opponent offer itself (/offer) — the client does
+        // not report opponent events, so it cannot fabricate one. The server only
+        // accepts the figures as authoritative when `/turn` authorized them.
+        const offerAuth = latestAuthRef.current;
+        void reconcileOffer(
+          {
+            pkg: offer,
+            conditions,
+            authorizationToken: offerAuth?.action === "offer" ? offerAuth.token : undefined,
+          },
+          elapsedMs(),
+        );
         return JSON.stringify({ delivered: true });
       }
 
@@ -698,24 +990,40 @@ export function useVoiceAgent(args: {
           sign_on: num(args.sign_on),
           equity: num(args.equity),
         };
-        // Same mirror rule: the accepted package is exactly what the recruiter
-        // accepted out loud — shown instantly, persisted by the server. The
-        // deal is done the moment they call this tool, so the call is armed to
-        // close as soon as they finish saying so.
+        // The panel mirrors what the recruiter just said, but the DEAL is not
+        // the model's to declare: the server re-evaluates the package against
+        // the authoritative economics. The call is only armed to close — and the
+        // acceptance banner only shown — once the engine confirms it, and the
+        // tool result carries the verdict back so the recruiter can correct
+        // itself if the model jumped the gun.
         setOffer(offer);
-        patch({ acceptedOffer: offer });
-        armAcceptCloseRef.current();
-        void reconcileOffer({ pkg: offer, accepted: true }, elapsedMs()).then((res) => {
-          patch({ acceptedOffer: res?.offer ?? offer });
+        const acceptAuth = latestAuthRef.current;
+        void reconcileOffer(
+          {
+            pkg: offer,
+            acceptPackage: offer,
+            authorizationToken: acceptAuth?.action === "accept" ? acceptAuth.token : undefined,
+          },
+          elapsedMs(),
+        ).then((res) => {
+          if (res?.accepted) {
+            patch({ acceptedOffer: res.offer ?? offer, offerNotice: null });
+            armAcceptCloseRef.current();
+          } else {
+            patch({
+              acceptedOffer: null,
+              offerNotice:
+                res?.accept_reason ??
+                (res
+                  ? "The engine did not validate that agreement — the numbers are not confirmed."
+                  : null),
+            });
+          }
         });
-        queueEvent({
-          type: "commitment_signal",
-          actor: "opponent",
-          source: "tool",
-          payload: { package: offer, note: "recruiter accepted the candidate's package" },
-          at_ms: elapsedMs(),
+        return JSON.stringify({
+          status: "pending_validation",
+          note: "The platform validates every agreement against the company's approved economics before it is final. If it is rejected you will be told and must not treat the deal as agreed.",
         });
-        return JSON.stringify({ accepted: true });
       }
 
       if (name === "log_user_move") {
@@ -752,11 +1060,45 @@ export function useVoiceAgent(args: {
   // WS send helpers
   // ---------------------------------------------------------------------------
 
-  const send = useCallback((msg: ClientMsg) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(msg));
+  /**
+   * Write a message to the voice socket, reporting whether it actually left.
+   *
+   * This used to return nothing and silently no-op when the socket was not open,
+   * which is how an engine directive could be produced, acknowledged and then
+   * dropped on the floor during a reconnect.
+   */
+  const send = useCallback((msg: ClientMsg): boolean => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(msg));
+      return true;
     }
+    return false;
   }, []);
+
+  /**
+   * Deliver any directive that could not be written when it was produced.
+   *
+   * Called once the session is ready again — never re-runs `/turn` (the engine's
+   * decision already happened) and never re-sends a directive that was written
+   * successfully (each is keyed by its turn id and removed on delivery).
+   */
+  const persistDirectives = useCallback(() => {
+    const pending = directiveRelayRef.current.snapshot();
+    storageSet(
+      directiveKey(argsRef.current.attemptId),
+      pending.length > 0 ? JSON.stringify(pending) : null,
+    );
+  }, []);
+
+  const flushDirectives = useCallback(() => {
+    directiveRelayRef.current.drain(
+      (content) => send({ type: "conversation.message", role: "system", content }),
+    );
+    persistDirectives();
+  }, [persistDirectives, send]);
+  const flushDirectivesRef = useRef(flushDirectives);
+  flushDirectivesRef.current = flushDirectives;
 
   // ---------------------------------------------------------------------------
   // Turn relay: user utterance → server engine → directive → agent
@@ -804,19 +1146,32 @@ export function useVoiceAgent(args: {
       turnInFlightRef.current = true;
       patch({ recruiterThinking: true });
       try {
-        let data: { directive: TurnDirective; final?: boolean; close?: CloseOutcome | null } | null =
-          null;
+        let data: {
+          directive: TurnDirective;
+          final?: boolean;
+          close?: CloseOutcome | null;
+          authorization?: { token: string; action: "offer" | "accept"; package: CompPackage } | null;
+        } | null = null;
+        // One idempotency key for this utterance, reused by the retry: if the
+        // first request timed out but still committed, the second returns the
+        // stored answer instead of negotiating the same sentence twice.
+        const turnId = newTurnId();
         // One retry: the relay must not die on a single dropped request — an
         // unbounded, unretried fetch is how the recruiter used to go deaf for
         // the rest of a call after one network blip.
         for (let attempt = 0; attempt < 2 && !data; attempt++) {
           try {
-            const res = await withTimeout(
-              fetch(`/api/attempts/${argsRef.current.attemptId}/turn`, {
+            const res = await fetchWithTimeout(
+              `/api/attempts/${argsRef.current.attemptId}/turn`,
+              {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ user_text: text, user_interrupted: interrupted }),
-              }),
+                body: JSON.stringify({
+                  user_text: text,
+                  user_interrupted: interrupted,
+                  turn_id: turnId,
+                }),
+              },
               TURN_FETCH_TIMEOUT_MS,
             );
             if (!res.ok) throw new Error(`turn ${res.status}`);
@@ -824,6 +1179,7 @@ export function useVoiceAgent(args: {
               directive: TurnDirective;
               final?: boolean;
               close?: CloseOutcome | null;
+              authorization?: { token: string; action: "offer" | "accept"; package: CompPackage } | null;
             };
           } catch (err) {
             if (attempt === 1) {
@@ -842,6 +1198,10 @@ export function useVoiceAgent(args: {
         // A mere `final` hold is just "that's my best" and never ends the call,
         // so the candidate can still accept or bring something new.
         pendingCloseRef.current = data?.close ?? null;
+        // The server's proof that this turn authorized a recruiter action. The
+        // tool call that follows presents it, so a browser cannot invent an
+        // offer or an acceptance. A turn that authorizes nothing clears it.
+        latestAuthRef.current = data?.authorization ?? null;
 
         const lines: string[] = [`SYSTEM DIRECTIVE (obey exactly): ${d.verdict}`];
         // The on-table package travels with every directive: the model restates
@@ -869,7 +1229,19 @@ export function useVoiceAgent(args: {
           );
         }
 
-        send({ type: "conversation.message", role: "system", content: lines.join("\n") });
+        // Deliver now, or queue by turn id for the next time the session is
+        // ready. Either way the turn is considered processed — the pump must not
+        // re-run `/turn` because delivery was temporarily impossible.
+        const directiveText = lines.join("\n");
+        const delivered = send({
+          type: "conversation.message",
+          role: "system",
+          content: directiveText,
+        });
+        if (!delivered) {
+          directiveRelayRef.current.enqueue({ key: turnId, content: directiveText });
+          persistDirectives();
+        }
         return true;
       } finally {
         turnInFlightRef.current = false;
@@ -878,7 +1250,7 @@ export function useVoiceAgent(args: {
         pumpTurnQueueRef.current();
       }
     },
-    [patch, send],
+    [patch, persistDirectives, send],
   );
 
   // The pump dispatches through this ref so it can live above the dispatcher
@@ -979,6 +1351,30 @@ export function useVoiceAgent(args: {
       });
   }, [failSetup, mic, onMicChunk]);
 
+  /**
+   * Tell the server which voice session this attempt is using.
+   *
+   * The attempt's session binding decides which transcript `/complete` scores, so
+   * it is recorded explicitly rather than being whatever the next events batch
+   * happens to carry. A reconnect that produces a new session id is authorized
+   * by sending the previous one — the client has to prove it knows the binding it
+   * is replacing.
+   */
+  const bindSessionId = useCallback((sessionId: string, previousSessionId: string | null) => {
+    const attemptId = argsRef.current.attemptId;
+    void fetch(`/api/attempts/${attemptId}/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        previous_session_id: previousSessionId,
+      }),
+    }).catch(() => {
+      // Non-fatal for the live call: the events flush carries the session id as
+      // a fallback for the FIRST bind, and completion refuses a conflicting one.
+    });
+  }, []);
+
   const connectInner = useCallback(
     async (resumeSessionId: string | null) => {
       const a = argsRef.current;
@@ -987,7 +1383,12 @@ export function useVoiceAgent(args: {
       const tokenTimer = window.setTimeout(() => tokenCtl.abort(), SETUP_TIMEOUT_MS);
       let token: string;
       try {
-        const res = await fetch("/api/token", { signal: tokenCtl.signal });
+        // The token is scoped to THIS attempt: the server verifies that the
+        // caller owns it, that it is still active and that its agent mode is
+        // actually servable before minting anything.
+        const res = await fetch(`/api/token?attempt_id=${encodeURIComponent(a.attemptId)}`, {
+          signal: tokenCtl.signal,
+        });
         if (!res.ok) throw new Error(`Token request failed (${res.status})`);
         ({ token } = (await res.json()) as { token: string });
       } catch (err) {
@@ -1131,10 +1532,21 @@ export function useVoiceAgent(args: {
 
         switch (event.type) {
           case "session.ready": {
+            const previousSessionId = sessionIdRef.current;
             sessionIdRef.current = event.session_id;
+            storageSet(sessionKey(argsRef.current.attemptId), event.session_id);
             clearSetupTimers();
             patch({ status: "ready", sessionId: event.session_id });
-            startedAtRef.current = Date.now();
+            // The start time belongs to the ATTEMPT (seeded from the server), so
+            // reconnecting must not restart the elapsed clock or the
+            // max-duration guard.
+            startedAtRef.current = resolveAttemptStartedAt(
+              argsRef.current.startedAtMs,
+              startedAtRef.current,
+            );
+            bindSessionId(event.session_id, previousSessionId);
+            // A directive produced while the socket was down is delivered now.
+            flushDirectivesRef.current();
             // Mic capture was already started at ws.onopen (pre-flight). If
             // that start is still pending, startMic() is a no-op and the
             // original handler keeps streaming into this socket.
@@ -1360,6 +1772,7 @@ export function useVoiceAgent(args: {
       }
     },
     [
+      bindSessionId,
       clearSetupTimers,
       flushPendingTools,
       patch,
@@ -1433,6 +1846,10 @@ export function useVoiceAgent(args: {
     if (ws && ws.readyState === WebSocket.OPEN) {
       window.setTimeout(() => ws.close(), 500);
     }
+    // The call is over: the session must not be resumed by a later reload.
+    storageSet(sessionKey(argsRef.current.attemptId), null);
+    storageSet(directiveKey(argsRef.current.attemptId), null);
+    directiveRelayRef.current.clear();
     deferralRef.current = false;
     pendingTurnsRef.current = []; // nothing queued may survive the call
     agentSpeakingAtRef.current = 0;
@@ -1531,6 +1948,22 @@ export function useVoiceAgent(args: {
       end();
     }
   }, [state.elapsedSec, state.status, end]);
+
+  // Mirror the transcript so a reload mid-call does not lose the conversation.
+  useEffect(() => {
+    storageSet(
+      transcriptKey(args.attemptId),
+      JSON.stringify(state.transcript.slice(-MAX_PERSISTED_TURNS)),
+    );
+  }, [args.attemptId, state.transcript]);
+
+  // The socket is rebuilt from scratch on restart, so the old session id is
+  // stale by the time the new one is ready.
+  useEffect(() => {
+    if (state.status === "connecting" && restartingRef.current) {
+      storageSet(sessionKey(args.attemptId), null);
+    }
+  }, [args.attemptId, state.status]);
 
   // Periodic event flush.
   useEffect(() => {

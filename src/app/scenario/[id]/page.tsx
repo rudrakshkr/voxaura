@@ -46,17 +46,9 @@ export default function ScenarioPrepPage() {
         throw new Error(body.error ?? `Could not start (${res.status})`);
       }
       const data = (await res.json()) as AttemptResponse;
-      // agent_id is not secret (the prompt is); passing it here lets the
-      // session bind to this attempt's stored opponent directly. When the
-      // mode is inline, the system_prompt is also passed for the session page
-      // to forward to the client-side voice config.
-      const params = new URLSearchParams();
-      params.set("attempt", data.attempt_id);
-      params.set("mode", data.agent_mode);
-      if (data.agent_id) params.set("agent", data.agent_id);
-      if (data.system_prompt) params.set("prompt", data.system_prompt);
-      if (data.greeting) params.set("greeting", data.greeting);
-      router.push(`/scenario/${id}/session?${params.toString()}`);
+      // The session page resolves the frozen agent mode and stored-agent binding
+      // from the server-side attempt row. Only the attempt id belongs in the URL.
+      router.push(`/scenario/${id}/session?attempt=${encodeURIComponent(data.attempt_id)}`);
     } catch (err) {
       setError((err as Error).message);
       setStarting(false);

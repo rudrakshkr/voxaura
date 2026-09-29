@@ -131,27 +131,36 @@ export function ScenarioCard({
         <Link href={`/scenario/${scenario.id}`} className="btn btn-primary flex-1 text-sm">
           Start call
         </Link>
-        <button
-          className="btn btn-ghost text-sm"
-          disabled={busy}
-          onClick={() => {
-            setDraft(toDraft(scenario));
-            setError(null);
-            setEditing(true);
-          }}
-        >
-          Edit
-        </button>
-        <button
-          className="btn btn-ghost text-sm text-red-300"
-          disabled={busy}
-          onClick={() => {
-            setError(null);
-            setConfirming(true);
-          }}
-        >
-          Delete
-        </button>
+        {scenario.is_demo ? (
+          // The sample library is public and read-only. Saying so here is better
+          // than offering Edit/Delete and letting the server refuse: the data is
+          // shared demo material, not this visitor's scenario.
+          <span className="text-xs text-white/45">Sample · read-only</span>
+        ) : (
+          <>
+            <button
+              className="btn btn-ghost text-sm"
+              disabled={busy}
+              onClick={() => {
+                setDraft(toDraft(scenario));
+                setError(null);
+                setEditing(true);
+              }}
+            >
+              Edit
+            </button>
+            <button
+              className="btn btn-ghost text-sm text-red-300"
+              disabled={busy}
+              onClick={() => {
+                setError(null);
+                setConfirming(true);
+              }}
+            >
+              Delete
+            </button>
+          </>
+        )}
       </div>
 
       {error && !editing && <p className="text-xs text-red-300">{error}</p>}

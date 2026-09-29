@@ -32,6 +32,21 @@ const EnvSchema = z.object({
   LLM_MODEL: z.string().default("gpt-4o-mini"),
   AI_DEBUG: flag,
   ALLOW_INLINE_AGENT: flag,
+  /**
+   * Which opponent-agent binding to use.
+   *
+   * - `auto` (default): inline. AssemblyAI agents created from serverless
+   *   infrastructure are not resolvable from a browser IP, which produces a
+   *   1008 close — inline config is the reliable path, so it is the default
+   *   rather than a silent last-resort fallback.
+   * - `stored`: always bind a stored agent; the system prompt never leaves the
+   *   server. Use this when agents resolve for your deployment.
+   * - `inline`: force inline (requires ALLOW_INLINE_AGENT not to be "0").
+   *
+   * `ALLOW_INLINE_AGENT=0` explicitly disables the inline path, which also
+   * disables the only endpoint that can serve the prompt to a browser.
+   */
+  AGENT_MODE: z.enum(["auto", "stored", "inline"]).default("auto"),
 });
 
 let cached: z.infer<typeof EnvSchema> | null = null;
@@ -57,6 +72,17 @@ export function requireOpenAIKey(): string {
     throw new ApiKeyMissingError("OPENAI_API_KEY");
   }
   return key;
+}
+
+/**
+ * The raw tri-state of ALLOW_INLINE_AGENT. `Boolean("0")` is true, so the
+ * presence of the variable has to be read directly to tell "unset" apart from
+ * "explicitly disabled" — the default must not accidentally forbid inline mode.
+ */
+export function inlineAgentFlag(): "on" | "off" | "unset" {
+  const raw = process.env.ALLOW_INLINE_AGENT;
+  if (raw == null || raw === "") return "unset";
+  return raw === "1" || raw.toLowerCase() === "true" ? "on" : "off";
 }
 
 export class ApiKeyMissingError extends Error {

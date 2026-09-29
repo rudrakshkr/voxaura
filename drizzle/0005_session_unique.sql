@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX IF NOT EXISTS "attempts_session_unique" ON "attempts" USING btree ("session_id");

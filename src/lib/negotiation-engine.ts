@@ -41,19 +41,83 @@ export interface UserMoveClassification {
   interruption: boolean;
 }
 
-const BASE_RE =
-  /\$?\s?(\d{2,3})(?:[,.](\d{1,3}))?\s?(?:k\b|thousand|grand|,\d{3}|\.\d{3})?/gi;
+/**
+ * Digit runs that are never money: phone numbers / ids (8+ digits) and bare
+ * four-digit years. Both used to be read as salaries.
+ */
+function stripNonMonetaryDigits(text: string): string {
+  return text
+    .replace(/\b\d{8,}\b/g, " ")
+    // A four-digit 19xx/20xx run is a year, not a salary — but only when it is
+    // not part of a longer number ("190000" contains "1900" and must survive).
+    .replace(/(?<![\d$,.])(?:19|20)\d{2}(?![\d,])/g, " ");
+}
 
+/**
+ * Words that make an UNMARKED number read as compensation. Strong context can
+ * appear anywhere near the figure; weak context only counts when it comes
+ * BEFORE it, which is how people actually cite a market range ("market data …
+ * shows 155 to 165") and keeps "a team of 150 people at this level" from being
+ * read as a $150,000 ask.
+ */
+const MONEY_CONTEXT_STRONG =
+  /(\$|base|salary|comp(?:ensation)?\b|pay\b|package|total|sign[- ]?on|bonus|equity|stock|rsu|offer|dollars|budget|floor|target|worth|annual|per year|a year|want|wanted|need|needs|asking|ask\b|looking for|at least|minimum|come up|settle|expect(?:ing|ed)?)/i;
+const MONEY_CONTEXT_WEAK =
+  /(market|data|median|benchmark|going rate|range|\bbands?\b|comparable|percentile|survey)/i;
+
+/** A candidate amount: optional `$`, digits (maybe comma-grouped), optional k-suffix. */
+const AMOUNT_RE = /(\$)?\s*(\d[\d,]*)\s*(k\b|thousand|grand)?/gi;
+
+/**
+ * Extract salary-scale amounts from an utterance.
+ *
+ * The old parser matched any 2–3 digit run and scaled it, so "I graduated in
+ * 2024" produced a $202,000 ask and "my phone is 9876543210" produced a
+ * $987,000 one — the recruiter then answered a number nobody said. A figure
+ * now counts as money only when it is explicitly marked (a `$`, a k/thousand/
+ * grand suffix, or comma-grouping) or sits next to salary context in the same
+ * clause. Bare four-digit integers and unmarked round numbers are not salaries.
+ */
 function extractAmounts(text: string): number[] {
+  const cleaned = stripNonMonetaryDigits(text);
   const out: number[] = [];
-  for (const m of text.matchAll(BASE_RE)) {
-    const hundreds = parseInt(m[1], 10);
-    const frac = m[2] ? parseInt(m[1] + m[2].padEnd(3, "0"), 10) : null;
+  for (const m of cleaned.matchAll(AMOUNT_RE)) {
+    const raw = m[0];
+    const dollar = m[1];
+    const digits = m[2];
+    const suffix = m[3];
+    const n = parseInt(digits.replace(/,/g, ""), 10);
+    if (!Number.isFinite(n) || n <= 0) continue;
+
+    const commaGrouped = /\d,\d{3}/.test(digits);
+    const marked = Boolean(dollar) || Boolean(suffix) || commaGrouped;
+
     let val: number;
-    if (/k\b|thousand|grand/i.test(m[0])) val = hundreds * 1000;
-    else if (frac !== null && frac >= 40000) val = frac;
-    else if (hundreds >= 40) val = hundreds * 1000; // "145" → 145k
-    else val = frac ?? hundreds * 1000;
+    if (suffix) {
+      // "1200k" is not a real figure — only 1–3 digit multipliers take a suffix.
+      if (digits.replace(/,/g, "").length > 3) continue;
+      val = n * 1000;
+    } else if (dollar || commaGrouped) {
+      val = n;
+    } else if (n >= 40 && n <= 999) {
+      val = n * 1000; // "145 base" → 145,000
+    } else if (n >= 10000) {
+      val = n; // "150000" — four-digit numbers are years, not salaries
+    } else {
+      continue;
+    }
+
+    // Only explicitly-marked figures stand alone; everything else needs salary
+    // context in the same neighbourhood ("…years of experience" does not).
+    if (!marked) {
+      const at = m.index ?? 0;
+      const before = cleaned.slice(Math.max(0, at - 56), at);
+      const after = cleaned.slice(at + raw.length, Math.min(cleaned.length, at + raw.length + 28));
+      if (!MONEY_CONTEXT_STRONG.test(`${before} ${after}`) && !MONEY_CONTEXT_WEAK.test(before)) {
+        continue;
+      }
+    }
+
     if (val >= 40000 && val <= 990000) out.push(val);
   }
   return out;
@@ -312,11 +376,103 @@ export function maxOfferTotal(hidden: HiddenState): number {
   return Math.min(packageEnvelope(hidden), acceptanceTotalThreshold(hidden));
 }
 
-/** Would the recruiter sign off on this package as it stands? */
+/**
+ * The company's hard package limits.
+ *
+ * These are not negotiable at any price and are checked before anything else:
+ * - base may never exceed the base budget;
+ * - sign-on and equity may never exceed their flex caps;
+ * - the first-year total may never exceed `maxOfferTotal`.
+ *
+ * This used to be checked NOWHERE, and the omission was exploitable. The old
+ * acceptance predicate asked only "is the base at/above the bar, or the total at
+ * /above the total bar?" — so `{base: 999999}` satisfied it, and a single
+ * `/offer` call with `accept_candidate_package` finalized an accepted attempt at
+ * a salary no band could ever authorize. The hard limits are the reason the
+ * predicate exists, so they live in the predicate rather than beside it.
+ */
+export function withinPackageLimits(hidden: HiddenState, pkg: CompPackage): boolean {
+  const signOn = pkg.sign_on ?? 0;
+  const equity = pkg.equity ?? 0;
+  if (!Number.isFinite(pkg.base) || pkg.base < 0) return false;
+  if (signOn < 0 || equity < 0) return false;
+  if (pkg.base > hidden.budget) return false;
+  if (signOn > (hidden.flex.sign_on_max ?? 0)) return false;
+  if (equity > (hidden.flex.equity_max ?? 0)) return false;
+  if (total(pkg) > maxOfferTotal(hidden)) return false;
+  return true;
+}
+
+/**
+ * Would the recruiter sign off on this package as it stands?
+ *
+ * The ONE canonical acceptance predicate: every acceptance path — the engine's
+ * own turn decision, the `accept_candidate_package` request — must go through
+ * it, and it enforces the hard caps before it looks at the bar.
+ */
 export function acceptsPackage(hidden: HiddenState, pkg: CompPackage): boolean {
+  if (!withinPackageLimits(hidden, pkg)) return false;
   return (
     pkg.base >= acceptanceThreshold(hidden) || total(pkg) >= acceptanceTotalThreshold(hidden)
   );
+}
+
+/**
+ * Reduce a package until it satisfies the hard limits, without inventing value.
+ *
+ * Used only where the product deliberately says yes regardless of the bar (the
+ * candidate insisting on a close): the deal still has to be one the company can
+ * authorize. A figure the recruiter improvised beyond the band therefore becomes
+ * a scoring signal, never the settlement.
+ */
+export function clampPackageToLimits(hidden: HiddenState, pkg: CompPackage): CompPackage {
+  let base = Math.max(0, Math.round(Number.isFinite(pkg.base) ? pkg.base : 0));
+  let signOn = Math.max(0, Math.round(pkg.sign_on ?? 0));
+  let equity = Math.max(0, Math.round(pkg.equity ?? 0));
+  base = Math.min(base, hidden.budget);
+  signOn = Math.min(signOn, hidden.flex.sign_on_max ?? 0);
+  equity = Math.min(equity, hidden.flex.equity_max ?? 0);
+
+  let over = base + signOn + equity - maxOfferTotal(hidden);
+  if (over > 0) {
+    // Trim flex first and base last: base is the figure the candidate actually
+    // anchored on, so it survives the cut wherever the structure allows it.
+    const cutEquity = Math.min(equity, over);
+    equity -= cutEquity;
+    over -= cutEquity;
+    const cutSignOn = Math.min(signOn, over);
+    signOn -= cutSignOn;
+    over -= cutSignOn;
+    base -= Math.min(base, over);
+  }
+  return { base, sign_on: signOn, equity };
+}
+
+export interface PackageAnomaly {
+  /** Total above anything the band can ever authorize — an invented figure. */
+  overCeiling: boolean;
+  /** Base below the recruiter's OWN opening: the offer went backwards. */
+  belowOpening: boolean;
+}
+
+/**
+ * Is a package on the table genuinely anomalous, given the band?
+ *
+ * Deliberately narrow. A base below the company's RESERVATION is not flagged:
+ * the opening anchor is set below the reservation so there is room to negotiate
+ * up, so ordinary early-call packages sit under that line by design. Flagging
+ * them made every routine mirror look like a hallucination in the report.
+ */
+export function packageAnomaly(hidden: HiddenState, pkg: CompPackage): PackageAnomaly {
+  return {
+    overCeiling: total(pkg) > maxOfferTotal(hidden),
+    belowOpening: pkg.base < hidden.opening_anchor,
+  };
+}
+
+export function isPackageAnomalous(hidden: HiddenState, pkg: CompPackage): boolean {
+  const a = packageAnomaly(hidden, pkg);
+  return a.overCeiling || a.belowOpening;
 }
 
 /**
@@ -402,7 +558,16 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
     // somebody says yes is not a negotiation, and refusing a genuine yes is
     // worse than taking a modest deal — the score tells the candidate what they
     // left behind.
-    if (state.acceptAttempts >= 2) return { kind: "accept", package: state.currentOffer };
+    //
+    // The yes is still bounded by the band. `state.currentOffer` can hold a
+    // package the recruiter IMPROVISED — it is mirrored verbatim so the panel
+    // agrees with the audio — and insisting must not turn a figure the company
+    // never authorized into the settlement. The deal is clamped into the hard
+    // limits before it is agreed, and the clamped figures are what the panel
+    // then shows.
+    if (state.acceptAttempts >= 2) {
+      return { kind: "accept", package: clampPackageToLimits(hidden, state.currentOffer) };
+    }
     // Premature close on a package below the bar → one real counter. Never a
     // closing hold: the candidate is trying to say yes, so a firm "that's my
     // best" has to leave room for them to insist.
@@ -607,39 +772,56 @@ function isCredibleLeverageAmount(amount: number, hidden: HiddenState): boolean 
   return amount >= hidden.reservation - 5000 && amount <= maxOfferTotal(hidden) + 20000;
 }
 
-/** Distribute a target total across levers without exceeding flex caps. */
+/**
+ * Distribute a target total across levers without ever exceeding a hard limit.
+ *
+ * Every number this returns must satisfy `withinPackageLimits`, because the
+ * acceptance predicate now enforces those limits: a package that overshoots the
+ * base ceiling by a rounding step would be one the engine could no longer accept
+ * from itself, and the strongest negotiation would end without a deal.
+ *
+ * Two things made that possible before:
+ * - the base headroom was measured as `budget - (base - opening_anchor)`, which
+ *   is hundreds of thousands of dollars of room that does not exist once the
+ *   base has moved off the opening anchor — the correct headroom under a BASE
+ *   budget is simply `budget - base`;
+ * - each component was rounded to the nearest $250 AFTER being capped, so a cap
+ *   could be exceeded by up to $125 per component.
+ * Rounding now applies to the amount GIVEN (downward), never to the cap.
+ */
 function bestSplit(
   hidden: HiddenState,
   state: EngineState,
   fromTotal: number,
   toTotal: number,
 ): CompPackage {
-  let remaining = Math.max(0, toTotal - fromTotal);
-  const pkg: CompPackage = {
-    base: state.currentOffer.base,
-    sign_on: state.currentOffer.sign_on ?? 0,
-    equity: state.currentOffer.equity ?? 0,
-  };
+  const cur = state.currentOffer;
+  // The target itself is clamped to the largest total the company can authorize,
+  // so a caller that asked for more cannot be handed more.
+  const cap = Math.min(toTotal, maxOfferTotal(hidden));
+  let remaining = Math.max(0, cap - fromTotal);
+  let base = cur.base;
+  let signOn = cur.sign_on ?? 0;
+  let equity = cur.equity ?? 0;
 
-  // Room left under the base ceiling: the budget minus every dollar of base
-  // already granted above the opening anchor. `granted.base` IS that distance,
-  // so subtracting both (as this once did) silently halved the real headroom.
-  const baseHeadroom = hidden.budget - (pkg.base - hidden.opening_anchor);
-  const baseRoom = Math.max(0, Math.min(baseHeadroom, remaining));
-  const baseGive = Math.min(baseRoom, Math.round(remaining * 0.7));
-  pkg.base = roundTo(pkg.base + baseGive, 250);
-  remaining = Math.max(0, remaining - (pkg.base - state.currentOffer.base));
+  // Whole $250 steps, so the figures the recruiter speaks stay round — but the
+  // step is taken off the GIVE, which is what keeps every cap exact.
+  const step = (n: number) => Math.floor(Math.max(0, n) / 250) * 250;
 
-  const signOnRoom = Math.max(0, (hidden.flex.sign_on_max ?? 0) - state.granted.sign_on);
-  const signGive = Math.min(signOnRoom, remaining);
-  pkg.sign_on = roundTo((pkg.sign_on ?? 0) + signGive, 250);
-  remaining = Math.max(0, remaining - ((pkg.sign_on ?? 0) - (state.currentOffer.sign_on ?? 0)));
+  const baseGive = Math.min(
+    Math.max(0, Math.min(hidden.budget - base, remaining)),
+    step(Math.round(remaining * 0.7)),
+  );
+  base += baseGive;
+  remaining -= baseGive;
 
-  const equityRoom = Math.max(0, (hidden.flex.equity_max ?? 0) - state.granted.equity);
-  const eqGive = Math.min(equityRoom, remaining);
-  pkg.equity = roundTo((pkg.equity ?? 0) + eqGive, 250);
+  const signGive = step(Math.max(0, Math.min((hidden.flex.sign_on_max ?? 0) - signOn, remaining)));
+  signOn += signGive;
+  remaining -= signGive;
 
-  return pkg;
+  equity += Math.max(0, Math.min((hidden.flex.equity_max ?? 0) - equity, remaining));
+
+  return { base, sign_on: signOn, equity };
 }
 
 function roundTo(n: number, step: number): number {
@@ -944,6 +1126,9 @@ export const NO_DEFERRAL_RULE =
 export function transcriptSignature(text: string): string {
   return text
     .toLowerCase()
+    // Collapse digit separators first: "155,000" and "155 000" are the same
+    // number, and the voice service finalises both spellings.
+    .replace(/(\d)[,\s]+(?=\d)/g, "$1")
     .replace(/[.,'\u2018\u2019]/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")

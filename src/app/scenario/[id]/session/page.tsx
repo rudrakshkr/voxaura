@@ -9,46 +9,84 @@ import { Spinner } from "@/components/ui";
 import type { ScenarioPublic } from "@/lib/types";
 
 interface AttemptDetail {
-  attempt: { id: string; status: string; retry_mode: string | null; greeting?: string };
+  attempt: {
+    id: string;
+    status: string;
+    retry_mode: string | null;
+    agent_mode: "stored" | "inline";
+    agent_id: string | null;
+    greeting?: string;
+    /** Server-recorded start, so the call clock is absolute across reconnects. */
+    started_at?: string;
+  };
   /** Server-authoritative standing package (already stated aloud). */
   current_offer?: { base: number; sign_on?: number | null; equity?: number | null } | null;
-  scenario: ScenarioPublic & { prep_pack: ScenarioPublic["prep_pack"] & { system_prompt?: string; greeting?: string } };
+  scenario: ScenarioPublic;
 }
 
+/**
+ * The call screen.
+ *
+ * The URL carries only the attempt identifier. Agent mode and stored-agent binding
+ * come from the server-side attempt row so the browser cannot override them with
+ * query parameters. Inline mode fetches its prompt from an owner-checked endpoint
+ * immediately before the call starts.
+ */
 export default function SessionPage() {
   const { id } = useParams<{ id: string }>();
   const params = useSearchParams();
   const attemptId = params.get("attempt");
-  const mode = (params.get("mode") ?? "stored") as "stored" | "inline";
-  const agentIdParam = params.get("agent") || null;
-  const promptParam = params.get("prompt") || null;
-  const greetingParam = params.get("greeting") || null;
 
   const [detail, setDetail] = useState<AttemptDetail | null>(null);
+  const [inlineConfig, setInlineConfig] = useState<{
+    systemPrompt: string;
+    greeting: string;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
     if (!attemptId) {
       setError("Missing attempt reference");
       return;
     }
-    fetch(`/api/attempts/${attemptId}`)
-      .then(async (res) => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch(`/api/attempts/${attemptId}`);
         if (!res.ok) throw new Error("Attempt not found");
         const data = (await res.json()) as AttemptDetail;
+        if (!alive) return;
         setDetail(data);
-      })
-      .catch((err) => setError((err as Error).message));
-  }, [attemptId]);
 
-  // Inline mode is always usable: it carries the prompt in the session
-  // config, so no server-side stored agent is required. This is the fallback
-  // path when stored-agent mode can't resolve the agent from the client IP.
-  const blocked =
-    !!detail &&
-    (mode === "stored"
-      ? !agentIdParam || detail.attempt.status === "abandoned"
-      : !attemptId);
+        if (data.attempt.agent_mode === "inline") {
+          const cfgRes = await fetch(`/api/attempts/${attemptId}/agent-config`);
+          if (!cfgRes.ok) {
+            throw new Error(
+              "This call's opponent configuration is unavailable. Start a fresh attempt from the prep page.",
+            );
+          }
+          const cfg = (await cfgRes.json()) as { system_prompt?: string; greeting?: string };
+          if (!cfg.system_prompt) throw new Error("Opponent configuration was empty.");
+          if (!alive) return;
+          setInlineConfig({
+            systemPrompt: cfg.system_prompt,
+            greeting:
+              cfg.greeting ??
+              data.attempt.greeting ??
+              "Hi, thanks for taking my call — I want to walk through the offer with you. Ready when you are.",
+          });
+        }
+      } catch (err) {
+        if (alive) setError((err as Error).message);
+      } finally {
+        if (alive) setReady(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [attemptId]);
 
   if (error) {
     return (
@@ -61,13 +99,19 @@ export default function SessionPage() {
     );
   }
 
-  if (!detail) {
+  if (!detail || !ready || (detail.attempt.agent_mode === "inline" && !inlineConfig)) {
     return (
       <div className="flex items-center gap-2 text-white/50">
         <Spinner /> Loading call…
       </div>
     );
   }
+
+  const mode = detail.attempt.agent_mode;
+  const agentId = detail.attempt.agent_id;
+  const blocked =
+    detail.attempt.status === "abandoned" ||
+    (mode === "stored" && !agentId);
 
   if (blocked) {
     return (
@@ -83,31 +127,19 @@ export default function SessionPage() {
     );
   }
 
-  // Build inline config after the blocked check (detail is guaranteed non-null
-  // here). The greeting is resolved from the attempt detail (server-derived from
-  // the attempt's own hidden state), then the URL, then the scenario. An empty
-  // greeting is never sent: the agent would stay silent and the user would be
-  // left talking into a dead line.
-  const greeting =
-    detail.attempt.greeting ??
-    greetingParam ??
-    detail.scenario.prep_pack.greeting ??
-    "Hi, thanks for taking my call — I want to walk through the offer with you. Ready when you are.";
-  const inlineConfig =
-    mode === "inline" && promptParam
-      ? ({ systemPrompt: promptParam, greeting } as const)
-      : null;
-
   return (
     <VoiceSession
       key={attemptId ?? "attempt"}
       attemptId={attemptId ?? ""}
-      agentId={agentIdParam}
+      agentId={agentId}
       agentMode={mode}
       inlineConfig={inlineConfig}
       scenario={detail.scenario}
       retryMode={detail.attempt.retry_mode}
       initialOffer={detail.current_offer ?? null}
+      startedAtMs={
+        detail.attempt.started_at ? new Date(detail.attempt.started_at).getTime() : null
+      }
     />
   );
 }

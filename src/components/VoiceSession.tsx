@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 import { OfferMeter } from "./OfferMeter";
+import { SessionStatusBar } from "./SessionStatusBar";
 import { TranscriptView } from "./TranscriptView";
 import { VoiceStateBar } from "./VoiceStateBar";
 import { money, Spinner, StatusPill } from "./ui";
@@ -18,6 +19,8 @@ import type { ScenarioPublic } from "@/lib/types";interface Props {
   retryMode: string | null;
   /** Server-authoritative standing package, so the panel is never empty. */
   initialOffer?: { base: number; sign_on?: number | null; equity?: number | null } | null;
+  /** Epoch ms the ATTEMPT began, from the server — the clock survives reconnects. */
+  startedAtMs?: number | null;
 }
 
 /** The line the candidate should say when the recruiter stalls on a decision. */
@@ -25,15 +28,17 @@ const DECISION_LINE = "What did the team say?";
 
 export function VoiceSession(props: Props) {
   const router = useRouter();
-  const { state, connect, end, restart } = useVoiceAgent({
+  const { state, connect, end, restart, flushEvents } = useVoiceAgent({
     attemptId: props.attemptId,
     agentId: props.agentId,
     agentMode: props.agentMode,
     inlineConfig: props.inlineConfig ?? null,
     initialOffer: props.initialOffer ?? null,
+    startedAtMs: props.startedAtMs ?? null,
   });
   const [completing, setCompleting] = useState(false);
   const [completeError, setCompleteError] = useState<string | null>(null);
+  const [syncIncomplete, setSyncIncomplete] = useState(false);
   const [copied, setCopied] = useState(false);
   const completingRef = useRef(false);
 
@@ -43,6 +48,17 @@ export function VoiceSession(props: Props) {
     setCompleting(true);
     setCompleteError(null);
     try {
+      // Flush the durable event log BEFORE scoring: the report reads it, and a
+      // score generated from an incomplete log would under-report the call. The
+      // final flush is bounded (it retries transient failures only for a few
+      // seconds, never forever) and reports whether the log is complete, so an
+      // incomplete sync is stated rather than assumed away.
+      try {
+        const flushed = await flushEvents({ final: true, deadlineMs: 3_000 });
+        if (!flushed.ok) setSyncIncomplete(true);
+      } catch {
+        setSyncIncomplete(true);
+      }
       const res = await fetch(`/api/attempts/${props.attemptId}/complete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -164,6 +180,12 @@ export function VoiceSession(props: Props) {
           )}
         </div>
       )}
+
+      <SessionStatusBar
+        status={state.status}
+        sync={state.sync}
+        elapsedSec={state.elapsedSec}
+      />
 
       <VoiceStateBar
         status={state.status}
@@ -346,6 +368,13 @@ export function VoiceSession(props: Props) {
             )}
 
             {completeError && <p className="text-sm text-red-300">{completeError}</p>}
+
+            {syncIncomplete && !completeError && (
+              <p className="text-xs text-amber-200/80">
+                Some of this call&apos;s events could not be saved. Your score uses the recorded
+                transcript and the server-classified moves; a few UI annotations may be missing.
+              </p>
+            )}
 
             <Link
               href={`/scenario/${props.scenario.id}`}

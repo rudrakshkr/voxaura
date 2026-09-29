@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { ApiError } from "../api";
 import { env } from "../env";
 import type { Difficulty, HiddenState, PrepPack } from "../types";
 
@@ -50,6 +51,98 @@ function normalizeGeneratedFlex(h: HiddenState): HiddenState {
     return n > 0 && n < 1000 ? Math.round((n * h.opening_anchor) / 250) * 250 : Math.round(n);
   };
   return { ...h, flex: { ...h.flex, sign_on_max: fix(h.flex.sign_on_max), equity_max: fix(h.flex.equity_max) } };
+}
+
+/** Collapse whitespace and bound a single generated string. */
+function boundText(v: unknown, max: number): string {
+  return String(v ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+/**
+ * Bound the generated persona and prep text.
+ *
+ * Individual field schemas only check shape, so a model was free to return a
+ * 40-item priorities list, 10,000-character quirks, or a scenario with eight
+ * comp notes — all of which are persisted, re-served on every library read, and
+ * interpolated into later prompts. Every generated string and array is bounded
+ * here, after parsing, so nothing unbounded reaches the database.
+ */
+function boundPrepTitles(prep: PrepPack): PrepPack {
+  return {
+    title: boundText(prep.title, 120),
+    context: boundText(prep.context, 800),
+    role: boundText(prep.role, 80),
+    company: boundText(prep.company, 80),
+    comp_notes: (Array.isArray(prep.comp_notes) ? prep.comp_notes : [])
+      .map((n) => boundText(n, 200))
+      .filter((n) => n.length > 0)
+      .slice(0, 8),
+    coaching_objective: boundText(prep.coaching_objective, 500),
+    your_target: Math.round(prep.your_target),
+    your_reservation: Math.round(prep.your_reservation),
+  };
+}
+
+/**
+ * Make a generated hidden state internally coherent.
+ *
+ * The zod schema rejects impossible orderings, but only for the values exactly
+ * as they arrived — before flex repair and before persona trimming. Coherence is
+ * therefore re-established AFTER normalization: caps are clamped into the band,
+ * the persona is bounded, and the ordering invariants (opening anchor below the
+ * walk-away floor, floor below target, target within budget) are enforced. A
+ * scenario that cannot be made coherent is refused rather than stored, because a
+ * band where the anchor exceeds the budget makes the whole negotiation nonsense.
+ */
+export function repairHidden(h: HiddenState): HiddenState | null {
+  const budget = Math.round(h.budget);
+  const target = Math.min(Math.round(h.target), budget);
+  const reservation = Math.min(Math.round(h.reservation), target - 1_000);
+  const opening = Math.min(Math.round(h.opening_anchor), reservation - 1_000);
+  if (!(reservation > 0 && target > 0 && opening > 0 && budget >= target)) return null;
+
+  const persona = {
+    name: boundText(h.persona?.name, 60) || "Alex Morgan",
+    title: boundText(h.persona?.title, 80) || "Head of Engineering",
+    style: boundText(h.persona?.style, 60) || "brisk",
+    aggression: Math.min(5, Math.max(1, Math.round(h.persona?.aggression ?? 3))),
+    priorities: (h.persona?.priorities ?? []).map((p) => boundText(p, 120)).filter(Boolean).slice(0, 5),
+    quirks: (h.persona?.quirks ?? []).map((q) => boundText(q, 120)).filter(Boolean).slice(0, 5),
+  };
+  if (persona.priorities.length === 0) persona.priorities = ["budget discipline"];
+  if (persona.quirks.length === 0) persona.quirks = ["moves only on evidence"];
+
+  return {
+    ...h,
+    budget,
+    target,
+    reservation,
+    opening_anchor: opening,
+    hiring_urgency: Math.min(5, Math.max(1, Math.round(h.hiring_urgency ?? 3))),
+    flex: {
+      sign_on_max: Math.max(0, Math.min(budget, Math.round(h.flex.sign_on_max ?? 0))),
+      equity_max: Math.max(0, Math.min(budget, Math.round(h.flex.equity_max ?? 0))),
+      remote_days: Math.max(0, Math.min(5, Math.round(h.flex.remote_days ?? 0))),
+      start_date_weeks: Math.max(0, Math.min(12, Math.round(h.flex.start_date_weeks ?? 0))),
+      extra_pto_days: Math.max(0, Math.min(15, Math.round(h.flex.extra_pto_days ?? 0))),
+    },
+    persona,
+  };
+}
+
+/**
+ * The candidate's prep guidance must be coherent too: a walk-away floor at or
+ * above the goal inverts the candidate's own material, and the generator returns
+ * these as separate numbers with no relationship stated.
+ */
+function repairPrepCoherence(prep: PrepPack): PrepPack {
+  const target = prep.your_target;
+  let reservation = prep.your_reservation;
+  if (!(reservation < target)) reservation = Math.max(60_000, target - 10_000);
+  return { ...prep, your_target: target, your_reservation: reservation };
 }
 
 const PrepSchema = z.object({
@@ -382,10 +475,19 @@ export async function generateScenario(input: {
     prep: PrepPack;
   };
 
-  const hidden = normalizeGeneratedFlex(HiddenSchema.parse(parsed.hidden));
-  const prepPack: PrepPack = PrepSchema.parse(parsed.prep);
+  // Normalize, then BOUND, then re-establish coherence: the schema has already
+  // checked that the numbers are individually in range, but the ordering rules
+  // and every string/array limit have to hold for the final value too.
+  const repaired = repairHidden(normalizeGeneratedFlex(HiddenSchema.parse(parsed.hidden)));
+  if (!repaired) {
+    throw new ApiError(
+      503,
+      "The scenario generator returned incoherent economics. Try generating again.",
+    );
+  }
+  const prepPack = repairPrepCoherence(boundPrepTitles(PrepSchema.parse(parsed.prep)));
 
-  return { hidden, prepPack };
+  return { hidden: repaired, prepPack };
 }
 
 // ---------------------------------------------------------------------------

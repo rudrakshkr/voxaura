@@ -10,11 +10,24 @@ export type Difficulty = z.infer<typeof Difficulty>;
 export const Outcome = z.enum(["accepted", "rejected", "stalemate", "walked_away"]);
 export type Outcome = z.infer<typeof Outcome>;
 
-export const AttemptStatus = z.enum(["active", "completed", "abandoned"]);
+/**
+ * Attempt lifecycle.
+ *
+ * `finalizing` is the completion barrier (see `lib/finalize.ts`): the attempt is
+ * claimed by `/complete` and closed to every turn, offer and event until the
+ * report is written. It was missing from this shared enum, so code typed against
+ * it could not even name the state the runtime actually uses.
+ */
+export const AttemptStatus = z.enum(["active", "completed", "finalizing", "abandoned"]);
 export type AttemptStatus = z.infer<typeof AttemptStatus>;
 
 /**
  * Move taxonomy — the vocabulary of negotiation events.
+ *
+ * `fabricatable: false` marks event types the SERVER owns. A browser may report
+ * what it observed, but it must never be able to assert an economic fact: an
+ * acceptance, an opponent offer, or an engine inconsistency created by the
+ * client would let a candidate drive their own score.
  * Layer-1 (tool/heuristic, live) and layer-2 (LLM extract) share this space.
  */
 export const MoveType = z.enum([
@@ -40,6 +53,12 @@ export const MoveType = z.enum([
   "acceptance",
   "rejection",
   "walk_away",
+  /**
+   * The recruiter spoke a figure the engine did not authorize (or agreed to a
+   * package it rejects). Recorded server-side only, and scored: the panel mirrors
+   * what was said, so the report is where an over-promise becomes coaching.
+   */
+  "voice_engine_inconsistency",
 ]);
 export type MoveType = z.infer<typeof MoveType>;
 
@@ -145,6 +164,24 @@ export function normalizeHidden(h: HiddenState): HiddenState {
 // Visible prep pack (safe to ship to the browser)
 // ---------------------------------------------------------------------------
 
+/**
+ * Candidate-facing scenario material, frozen onto an attempt at creation.
+ *
+ * Everything here is already public (it is what the candidate is shown), but it
+ * must not CHANGE underneath a recorded attempt: scoring previously read the
+ * live scenario row, so editing a scenario rewrote the context and coaching
+ * objective of every attempt already made against it.
+ */
+export const ScenarioSnapshot = z.object({
+  title: z.string(),
+  company: z.string(),
+  role: z.string(),
+  level: z.string(),
+  difficulty: Difficulty,
+  prep_pack: z.lazy(() => PrepPack),
+});
+export type ScenarioSnapshot = z.infer<typeof ScenarioSnapshot>;
+
 export const PrepPack = z.object({
   title: z.string(),
   context: z.string(),
@@ -172,6 +209,11 @@ export const ScenarioPublic = z.object({
   level: z.string(),
   difficulty: Difficulty,
   prep_pack: PrepPack,
+  /**
+   * Part of the SAMPLE library: public to read, read-only to everyone. The UI
+   * uses this to label it and to stop offering edit/delete on it.
+   */
+  is_demo: z.boolean().default(false),
   created_at: z.string().datetime(),
 });
 export type ScenarioPublic = z.infer<typeof ScenarioPublic>;
@@ -201,6 +243,14 @@ export const RubricDimension = z.object({
   score: z.number().min(0).max(10),
   weight: z.number().min(0).max(1),
   feedback: z.string(),
+  /**
+   * The specific candidate moments that drove this score. Evidence is what
+   * makes a report coaching rather than opinion: an unexplained 6 is not
+   * actionable, and a claim with no quoted moment cannot be trusted.
+   */
+  evidence: z.array(z.string()).default([]),
+  /** Event seq numbers in the durable log this dimension is traceable to. */
+  event_seqs: z.array(z.number().int()).default([]),
 });
 export type RubricDimension = z.infer<typeof RubricDimension>;
 
@@ -258,3 +308,107 @@ export const BatchedEvent = z.object({
   at_ms: z.number().int().min(0).nullish(),
 });
 export type BatchedEvent = z.infer<typeof BatchedEvent>;
+
+/** Largest event payload that will be stored, in serialized characters. */
+export const MAX_EVENT_PAYLOAD_CHARS = 2000;
+
+/**
+ * Largest number of events one `/events` request may carry.
+ *
+ * Aggregate size limits.
+ *
+ * Per-item caps alone let a caller stay inside every field limit and still
+ * submit a multi-megabyte document: 500 turns of 4,000 characters is 2 MB of
+ * transcript that would be interpolated into an LLM prompt, and an event batch of
+ * 200 payloads is another. These caps bound the TOTAL, and are checked BEFORE any
+ * expensive LLM work so a hostile payload is rejected cheaply rather than paid
+ * for.
+ */
+export const MAX_TRANSCRIPT_CHARS = 120_000;
+export const MAX_TRANSCRIPT_TURNS = 400;
+/**
+ * Largest single transcript turn accepted or recovered, in chars.
+ *
+ * The aggregate caps are worthless against ONE enormous item: 400 turns of
+ * 4,000 characters is a bounded document, but a lone 5 MB "turn" is not. This
+ * is the limit `/complete` enforces per client turn, and the same limit the
+ * server's own recovered timeline is clamped to, so neither path can smuggle an
+ * arbitrarily large string into the scoring prompt.
+ */
+export const MAX_TRANSCRIPT_TURN_CHARS = 4_000;
+export const MAX_EVENT_BATCH_CHARS = 120_000;
+/** Largest stored report text (summary + all rubric feedback), in chars. */
+export const MAX_REPORT_TEXT_CHARS = 40_000;
+
+/**
+ * Largest number of events one `/events` request may carry.
+ *
+ * Shared by the server's schema (which rejects anything larger) and the client's
+ * flush loop (which splits its queue into batches of at most this size). A client
+ * that ignored the cap and posted its whole backlog would be answered with a 400
+ * forever, and — because a failed batch is retried — would never write another
+ * event for the rest of the call.
+ */
+export const MAX_EVENTS_PER_REQUEST = 200;
+
+/**
+ * Deterministic JSON for signature purposes.
+ *
+ * Key order must not matter: `jsonb` does not preserve it, so a payload read
+ * back from the database can serialise differently from the identical payload
+ * that was sent — which would make a retry look like a new event.
+ */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+}
+
+/**
+ * Identity of an event, for retry de-duplication.
+ *
+ * A flush whose response is lost is retried with the same batch, so the same
+ * event can arrive twice. Two events with the same type, actor, call-elapsed
+ * time and payload are the same recorded move; the timestamp is what keeps a
+ * genuinely repeated move (said again later in the call) distinct.
+ */
+export function eventSignature(e: {
+  type: string;
+  actor: string;
+  payload?: Record<string, unknown> | null;
+  at_ms?: number | null;
+}): string {
+  return `${e.type}|${e.actor}|${e.at_ms ?? ""}|${canonicalJson(e.payload ?? {})}`;
+}
+
+/**
+ * Bound an event payload before it is persisted.
+ *
+ * Scorer-extracted event payloads are model output: a malformed or hostile
+ * response could otherwise write an arbitrarily large blob into the durable
+ * event log (and from there into the report). An oversized payload is replaced
+ * with a truncated preview rather than dropped, so the event itself is still
+ * recorded and the report still knows something happened.
+ */
+export function capEventPayload(
+  payload: Record<string, unknown> | null | undefined,
+  maxChars = MAX_EVENT_PAYLOAD_CHARS,
+): Record<string, unknown> {
+  const value = payload ?? {};
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(value);
+  } catch {
+    // Circular or otherwise unserializable model output.
+    return { note: "unserializable payload discarded" };
+  }
+  if (typeof encoded !== "string") return { note: "unserializable payload discarded" };
+  if (encoded.length <= maxChars) return value;
+  return {
+    note: "payload truncated: exceeded the stored-event size limit",
+    preview: encoded.slice(0, maxChars),
+  };
+}

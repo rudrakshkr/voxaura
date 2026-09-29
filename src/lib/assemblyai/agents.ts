@@ -61,16 +61,21 @@ export async function updateAgent(id: string, body: Partial<CreateAgentBody>): P
   }
 }
 
-/** Best-effort cleanup — never throws. */
-export async function deleteAgent(id: string | null | undefined): Promise<void> {
-  if (!id) return;
+/** Best-effort cleanup; returns whether the remote resource is gone. */
+export async function deleteAgent(id: string | null | undefined): Promise<boolean> {
+  if (!id) return true;
   try {
     const key = requireAssemblyAIKey();
-    await fetch(`${BASE}/v1/agents/${id}`, {
+    const res = await fetch(`${BASE}/v1/agents/${id}`, {
       method: "DELETE",
       headers: { Authorization: key },
     });
-  } catch {
-    // ignore cleanup failures
+    if (res.ok || res.status === 404) return true;
+    const text = await res.text().catch(() => "");
+    console.warn(`[agents] delete failed (${res.status}): ${text}`);
+    return false;
+  } catch (err) {
+    console.warn("[agents] delete failed:", err);
+    return false;
   }
 }

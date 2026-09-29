@@ -7,6 +7,10 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "test": "tsx scripts/engine-test.ts && tsx scripts/hostile-llm-test.ts && tsx scripts/voice-logic-test.ts",
+    "test:integration": "tsx scripts/integration-test.ts",
+    "check": "npm run typecheck && npm run test",
+    "check:release": "npm run check && npm run build",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
     "seed": "tsx scripts/seed.ts"

@@ -16,19 +16,39 @@ interface HistoryRow {
   score: number | null;
   /** Score of the user's previous attempt on the SAME scenario (server-computed). */
   previous_score: number | null;
+  /** Public sample-library row — not the visitor's own attempt. */
+  is_demo: boolean;
   started_at: string;
 }
 
 export default function HistoryPage() {
   const [rows, setRows] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/history");
+      // Distinguish "you have no attempts yet" from "the request failed". The
+      // bare `.then(r => r.json())` rendered a 500 as an empty history, which
+      // reads as "your records are gone".
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? `Could not load your history (${res.status})`);
+      }
+      const d = (await res.json()) as { history?: HistoryRow[] };
+      setRows(d.history ?? []);
+    } catch (err) {
+      setError((err as Error).message || "Could not load your history.");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    fetch("/api/history")
-      .then((r) => r.json())
-      .then((d: { history: HistoryRow[] }) => setRows(d.history ?? []))
-      .catch(() => undefined)
-      .finally(() => setLoading(false));
+    void load();
   }, []);
 
   return (
@@ -46,7 +66,16 @@ export default function HistoryPage() {
         </div>
       )}
 
-      {!loading && rows.length === 0 && (
+      {error && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+          <span>{error}</span>
+          <button className="btn btn-ghost" onClick={() => void load()}>
+            Retry
+          </button>
+        </div>
+      )}
+
+      {!loading && !error && rows.length === 0 && (
         <p className="text-white/40">No attempts yet. Start a scenario from the home page.</p>
       )}
 
@@ -78,7 +107,14 @@ export default function HistoryPage() {
                         day: "numeric",
                       })}
                     </td>
-                    <td className="py-2 pr-4">{r.scenario_title}</td>
+                    <td className="py-2 pr-4">
+                      {r.scenario_title}
+                      {r.is_demo && (
+                        <span className="ml-2 rounded border border-violet-400/30 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-violet-200/80">
+                          Sample
+                        </span>
+                      )}
+                    </td>
                     <td className="py-2 pr-4 text-white/50">{r.retry_mode ?? "—"}</td>
                     <td className="py-2 pr-4">{r.outcome?.replace("_", " ") ?? "—"}</td>
                     <td className="py-2 pr-4 font-mono">{money(r.final_base)}</td>

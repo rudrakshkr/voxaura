@@ -16,12 +16,20 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
 
   async function load() {
+    setLoading(true);
+    setError(null);
     try {
       const res = await fetch("/api/scenarios");
+      // A non-2xx body is NOT an empty library. Rendering "No scenarios yet" for
+      // a 500 told the user their data was gone when the server was simply down.
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(body.error ?? `Could not load scenarios (${res.status})`);
+      }
       const data = (await res.json()) as { scenarios?: ScenarioListItem[] };
       setScenarios(data.scenarios ?? []);
-    } catch {
-      setError("Could not load scenarios — is the database configured?");
+    } catch (err) {
+      setError((err as Error).message || "Could not load scenarios — is the database configured?");
     } finally {
       setLoading(false);
     }
@@ -69,9 +77,16 @@ export default function Home() {
           </div>
         )}
 
-        {error && <p className="text-sm text-red-300">{error}</p>}
+        {error && (
+          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">
+            <span>{error}</span>
+            <button className="btn btn-ghost" onClick={() => void load()}>
+              Retry
+            </button>
+          </div>
+        )}
 
-        {!loading && scenarios.length === 0 && (
+        {!loading && !error && scenarios.length === 0 && (
           <p className="text-sm text-white/40">
             No scenarios yet — build your first one above, or run{" "}
             <code className="rounded bg-white/10 px-1.5 py-0.5">npm run seed</code>.

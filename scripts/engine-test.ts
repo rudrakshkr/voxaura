@@ -6,21 +6,27 @@
  */
 import "dotenv/config";
 
+import { z } from "zod";
+
 import {
   acceptanceThreshold,
   acceptanceTotalThreshold,
   acceptsPackage,
+  clampPackageToLimits,
   classifyUserMove,
   closingOutcome,
   decideRecruiterMove,
   detectHostileLanguage,
   dedupeTranscriptTurns,
   extractSpokenPackage,
+  isPackageAnomalous,
   maxOfferTotal,
   packageEnvelope,
   reconcileSpokenPackage,
+  withinPackageLimits,
   type EngineState,
 } from "../src/lib/negotiation-engine";
+import { mergePrepPack, prepPackError } from "../src/lib/scenario-prep";
 import {
   advanceRound,
   applyRecruiterPackage,
@@ -28,7 +34,23 @@ import {
   updateTrustScores,
 } from "../src/lib/engine-state";
 import { debugScenario } from "../src/lib/ai/generate";
-import type { RecruiterMove } from "../src/lib/negotiation-engine";
+import { decideAgentMode } from "../src/lib/agent-mode";
+import { runCounterfactuals } from "../src/lib/counterfactual";
+import { buildReplay } from "../src/lib/replay";
+import { CLIENT_REPORTABLE_EVENTS, attempts as attemptsTable, scenarios as scenariosTable } from "../src/lib/db/schema";
+import { getTableColumns } from "drizzle-orm";
+import { assertAttemptAccess, DEMO_OWNER_ID } from "../src/lib/access";
+import { toPublicScenario } from "../src/lib/db/queries";
+import {
+  BatchedEvent,
+  capEventPayload,
+  clampEventAtMs,
+  eventSignature,
+  MAX_EVENT_PAYLOAD_CHARS,
+  MAX_EVENTS_PER_REQUEST,
+  normalizeHidden,
+  type PrepPack,
+} from "../src/lib/types";
 
 const { hidden } = debugScenario("medium");
 const threshold = acceptanceThreshold(hidden);
@@ -421,6 +443,551 @@ console.log("\nR. Hostile language is detected; ordinary hard bargaining is not"
   check("a walk-away threat is not flagged", !detectHostileLanguage("I'll walk away and take the other offer."));
   check("self-reference to competence is not flagged", !detectHostileLanguage("I don't want to sound incompetent, but the band looks off."));
   check("an ordinary ask is not flagged", !detectHostileLanguage("I need 165,000 base and 20,000 sign-on."));
+}
+
+console.log("\nS. Money parsing requires monetary context (no invented salaries)");
+{
+  const ask = (t: string) => classifyUserMove(t).askedAmount;
+  check("a graduation year is not a salary", ask("I graduated in 2024.") === null, `got ${ask("I graduated in 2024.")}`);
+  check("a phone number is not a salary", ask("My phone is 9876543210.") === null, `got ${ask("My phone is 9876543210.")}`);
+  check("years of experience are not a salary", ask("I have 5 years of experience.") === null, `got ${ask("I have 5 years of experience.")}`);
+  check("a start delay is not a salary", ask("I can join in 2 weeks.") === null, `got ${ask("I can join in 2 weeks.")}`);
+  check("a rating is not a salary", ask("My performance review was 10/10.") === null, `got ${ask("My performance review was 10/10.")}`);
+  check("a ramp duration is not a salary", ask("I need 12 months to ramp.") === null, `got ${ask("I need 12 months to ramp.")}`);
+  check("a bare four-digit number is never a salary", ask("The req id is 2026 base pay band.") === null, `got ${ask("The req id is 2026 base pay band.")}`);
+  check("a long digit run is not a salary", ask("Account 1234567890 was charged.") === null, `got ${ask("Account 1234567890 was charged.")}`);
+  check(
+    "an unmarked round number far from money context is ignored",
+    ask("There are 150 people on the team.") === null,
+    `got ${ask("There are 150 people on the team.")}`,
+  );
+  check("a dollar figure is read", ask("My current salary is $110k.") === 110000, `got ${ask("My current salary is $110k.")}`);
+  check("a k figure with no other context is read", ask("I'd like 125k.") === 125000, `got ${ask("I'd like 125k.")}`);
+  check("a comma figure is read", ask("I'm looking for 150,000 base.") === 150000, `got ${ask("I'm looking for 150,000 base.")}`);
+  check("a spoken thousands figure is read", ask("I need 130 thousand.") === 130000, `got ${ask("I need 130 thousand.")}`);
+  check("a grand figure is read", ask("I want 140 grand.") === 140000, `got ${ask("I want 140 grand.")}`);
+  check("a market range is read", ask("Market data for this scope shows 155 to 165.") === 165000, `got ${ask("Market data for this scope shows 155 to 165.")}`);
+}
+
+console.log("\nT. Acceptance boundaries and lever caps are explicit");
+{
+  const th = acceptanceThreshold(hidden);
+  const tot = acceptanceTotalThreshold(hidden);
+  const signCap = hidden.flex.sign_on_max ?? 0;
+  const eqCap = hidden.flex.equity_max ?? 0;
+  check("base at the threshold is accepted", acceptsPackage(hidden, { base: th, sign_on: 0, equity: 0 }));
+  check("base one dollar below the threshold is not", !acceptsPackage(hidden, { base: th - 1, sign_on: 0, equity: 0 }));
+  // The total branch stays reachable — but only inside the flex caps. A package
+  // that clears the total bar with flex the company does not offer is not a
+  // package it can sign.
+  check(
+    "a flex-heavy package at the total bar is accepted",
+    acceptsPackage(hidden, { base: tot - signCap - eqCap, sign_on: signCap, equity: eqCap }),
+  );
+  check(
+    "one dollar below the total bar (same structure) is not",
+    !acceptsPackage(hidden, { base: tot - signCap - eqCap - 1, sign_on: signCap, equity: eqCap }),
+  );
+  check(
+    "the envelope is base ceiling plus both flex caps",
+    packageEnvelope(hidden) === hidden.budget + (hidden.flex.sign_on_max ?? 0) + (hidden.flex.equity_max ?? 0),
+  );
+  check("the offer cap never exceeds the envelope", maxOfferTotal(hidden) <= packageEnvelope(hidden));
+
+  // Drive the engine into every lever at once and check the invariants hold.
+  const spendy = freshState();
+  runTurn(spendy, "Market data for this scope shows 210 to 240, and I have a signed offer at 235k.");
+  runTurn(spendy, "I need 230000 base with 25000 sign-on and 20000 in annual equity.");
+  runTurn(spendy, "I want 235000 base, 25000 sign-on and 25000 equity — the market supports it.");
+  check("base never exceeds the ceiling", spendy.currentOffer.base <= hidden.budget, `base=${spendy.currentOffer.base}`);
+  check(
+    "sign-on never exceeds its cap",
+    (spendy.currentOffer.sign_on ?? 0) <= (hidden.flex.sign_on_max ?? 0),
+    `sign_on=${spendy.currentOffer.sign_on}`,
+  );
+  check(
+    "equity never exceeds its cap",
+    (spendy.currentOffer.equity ?? 0) <= (hidden.flex.equity_max ?? 0),
+    `equity=${spendy.currentOffer.equity}`,
+  );
+  check(
+    "the total never exceeds the authorized cap",
+    total(spendy.currentOffer) <= maxOfferTotal(hidden) + 250,
+    `total=${total(spendy.currentOffer)} cap=${maxOfferTotal(hidden)}`,
+  );
+}
+
+console.log("\nU. Counterfactuals replay the same engine, deterministically");
+{
+  const ctx = { prepTarget: 155000, prepReservation: 140000 };
+  const a = runCounterfactuals(hidden, { ...ctx, actual: { total: 150000, base: 140000, outcome: "stalemate" } });
+  const b = runCounterfactuals(hidden, { ...ctx, actual: { total: 150000, base: 140000, outcome: "stalemate" } });
+  check("the same scenario models identically twice", JSON.stringify(a.results) === JSON.stringify(b.results));
+  check("deltas are measured against the actual result", a.results.every((r) => r.deltaTotal === r.finalTotal - 150000));
+  check(
+    "every modeled package respects the ceiling",
+    a.results.every((r) => r.finalPackage.base <= hidden.budget),
+    a.results.map((r) => r.finalPackage.base).join(","),
+  );
+  const takeIt = a.results.find((r) => r.plan.key === "accept_opening");
+  check("taking the first number closes the deal", takeIt?.outcome === "accepted", `got ${takeIt?.outcome}`);
+  check(
+    "and lands at or above the opening anchor",
+    takeIt != null && takeIt.finalPackage.base >= hidden.opening_anchor,
+    `base=${takeIt?.finalPackage.base}`,
+  );
+  const levered = a.results.find((r) => r.plan.key === "lead_with_leverage");
+  check("the leverage plan runs real turns", (levered?.rounds ?? 0) > 0);
+  check(
+    "a higher anchor is never worse than taking the first number",
+    (() => {
+      const higher = a.results.find((r) => r.plan.key === "anchor_higher_10k");
+      return takeIt != null && higher != null && higher.finalTotal >= takeIt.finalTotal;
+    })(),
+  );
+  check("results are labeled as modeling, not promises", /modeled, not guaranteed/i.test(a.disclaimer));
+}
+
+console.log("\nU2. Only genuinely anomalous spoken packages are flagged");
+{
+  // Regression: a base below the company's RESERVATION is the normal early-call
+  // state (the opening anchor sits there by design) and must NOT be reported as
+  // a recruiter hallucination — that made every routine mirror look wrong.
+  check(
+    "a package below the reservation is not anomalous",
+    !isPackageAnomalous(hidden, { base: hidden.reservation - 8000, sign_on: 0, equity: 0 }),
+  );
+  check(
+    "a package below the opening anchor IS anomalous",
+    isPackageAnomalous(hidden, { base: hidden.opening_anchor - 1000, sign_on: 0, equity: 0 }),
+  );
+  check(
+    "a package above the authorized total IS anomalous",
+    isPackageAnomalous(hidden, { base: 0, sign_on: maxOfferTotal(hidden) + 1000, equity: 0 }),
+  );
+  const atCap = {
+    base: hidden.opening_anchor,
+    sign_on: maxOfferTotal(hidden) - hidden.opening_anchor,
+    equity: 0,
+  };
+  check("a package exactly at the authorized cap is not anomalous", !isPackageAnomalous(hidden, atCap));
+  check(
+    "the opening package itself is never anomalous",
+    !isPackageAnomalous(hidden, { base: hidden.opening_anchor, sign_on: 0, equity: 0 }),
+  );
+}
+
+console.log("\nV. Replay narration is traceable to the event log");
+{
+  const steps = buildReplay([
+    {
+      type: "user_offer",
+      actor: "user",
+      source: "tool",
+      payload: { amount: 160000, note: "I'm looking for 160,000 base." },
+      at_ms: 1000,
+      seq: 1,
+    },
+    {
+      type: "counteroffer",
+      actor: "opponent",
+      source: "tool",
+      payload: { package: { base: 140000, sign_on: 0, equity: 0 } },
+      at_ms: 2000,
+      seq: 2,
+    },
+    {
+      type: "counteroffer",
+      actor: "opponent",
+      source: "tool",
+      payload: { package: { base: 150000, sign_on: 5000, equity: 0 } },
+      at_ms: 3000,
+      seq: 3,
+    },
+  ]);
+  check("the replay keeps the server's order", steps.map((s) => s.seq).join(",") === "1,2,3");
+  check("a raised package reports its delta", steps[2].deltaTotal === 15000, `got ${steps[2].deltaTotal}`);
+  check("the running total tracks the standing package", steps[2].runningTotal === 155000, `got ${steps[2].runningTotal}`);
+  check("every step explains why it mattered", steps.every((s) => s.why.length > 0));
+}
+
+console.log("\nW. Agent mode is explicit and predictable");
+{
+  const base = { hasStoredAgentId: true, assemblyaiConfigured: true };
+  const auto = decideAgentMode({ ...base, requested: "auto", inlineFlag: "unset" });
+  check("auto uses the inline path that works from serverless", auto.mode === "inline");
+  check("and only then may the prompt reach a browser", auto.promptMayReachClient);
+  const off = decideAgentMode({ ...base, requested: "auto", inlineFlag: "off" });
+  check("ALLOW_INLINE_AGENT=0 forces stored mode", off.mode === "stored" && !off.promptMayReachClient);
+  const forced = decideAgentMode({ ...base, requested: "inline", inlineFlag: "off" });
+  check("an explicit inline request still respects the off switch", forced.mode === "stored");
+  const stored = decideAgentMode({ ...base, requested: "stored", inlineFlag: "on" });
+  check("stored mode never serves the prompt", stored.mode === "stored" && !stored.promptMayReachClient);
+  const noKey = decideAgentMode({
+    requested: "auto",
+    inlineFlag: "unset",
+    hasStoredAgentId: false,
+    assemblyaiConfigured: false,
+  });
+  check("with no voice provider nothing is served to a browser", !noKey.promptMayReachClient);
+}
+
+console.log("\nX. A client cannot report authoritative events");
+{
+  const allowed = new Set<string>(CLIENT_REPORTABLE_EVENTS);
+  check("the candidate's own moves are reportable", allowed.has("user_offer") && allowed.has("walk_away"));
+  check("an opponent offer is NOT client-reportable", !allowed.has("opponent_offer"));
+  check("an acceptance is NOT client-reportable", !allowed.has("acceptance"));
+  check(
+    "the candidate's own concession is reportable (actor forced to user)",
+    allowed.has("concession"),
+  );
+  check("an engine inconsistency is NOT client-reportable", !allowed.has("voice_engine_inconsistency"));
+  check("a fabricated acceptance cannot be logged as the candidate", !allowed.has("commitment_signal_from_opponent"));
+}
+
+console.log("\nX2. Model-supplied payloads are bounded before storage");
+{
+  const small = { note: "asked for 160k", amount: 160000 };
+  check("a normal payload passes through untouched", JSON.stringify(capEventPayload(small)) === JSON.stringify(small));
+  const huge = { note: "x".repeat(5000) };
+  const capped = capEventPayload(huge);
+  check("an oversized payload is truncated", typeof capped.preview === "string" && capped.preview.length <= MAX_EVENT_PAYLOAD_CHARS);
+  check("and says why instead of silently vanishing", /truncated/.test(String(capped.note)));
+  check("null payloads become an empty object", JSON.stringify(capEventPayload(null)) === "{}");
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  check(
+    "an unserializable payload is discarded safely",
+    /unserializable/.test(String(capEventPayload(circular).note)),
+  );
+}
+
+console.log("\nY. Persisted-state helpers behave at the edges");
+{
+  check("at_ms clamps an epoch value that would overflow the column", clampEventAtMs(Date.now()) === 2_000_000_000);
+  check("at_ms passes normal call-elapsed values through", clampEventAtMs(1234) === 1234);
+  check("at_ms rejects non-finite input", clampEventAtMs(Number.NaN) === null);
+  const fixed = normalizeHidden({ ...hidden, flex: { ...hidden.flex, equity_max: 0.05 } });
+  check(
+    "a fraction-style flex cap is repaired to dollars",
+    (fixed.flex.equity_max ?? 0) >= 1000,
+    `got ${fixed.flex.equity_max}`,
+  );
+  const turns = dedupeTranscriptTurns([
+    { role: "agent" as const, text: "That's 155,000 base.", atMs: 1000 },
+    { role: "agent" as const, text: "thats 155 000 base", atMs: 2000 },
+    { role: "user" as const, text: "I need 160.", atMs: 3000 },
+    { role: "agent" as const, text: "thats 155 000 base", atMs: 90_000 },
+  ]);
+  check("a duplicated utterance is collapsed once", turns.length === 3, `got ${turns.length}`);
+}
+
+console.log("\nZ. The event-flush batch cap is the one the server enforces");
+{
+  // The client splits its queue with MAX_EVENTS_PER_REQUEST and /events refuses
+  // anything larger. If the two ever drift, a flush that has queued more than
+  // the cap is answered 400 forever, and every event behind it is never logged.
+  const schema = z.array(BatchedEvent).max(MAX_EVENTS_PER_REQUEST);
+  const batch = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      type: "rapport" as const,
+      actor: "user" as const,
+      source: "tool" as const,
+      payload: { i },
+      at_ms: i,
+    }));
+  check(
+    "a full-size chunk is accepted by the server",
+    schema.safeParse(batch(MAX_EVENTS_PER_REQUEST)).success,
+  );
+  check(
+    "one event over the cap is refused, so the client must chunk",
+    !schema.safeParse(batch(MAX_EVENTS_PER_REQUEST + 1)).success,
+  );
+  check(
+    "the cap is a sane positive integer",
+    Number.isInteger(MAX_EVENTS_PER_REQUEST) && MAX_EVENTS_PER_REQUEST > 0,
+  );
+}
+
+console.log("\nAB. A retried event batch cannot be recorded twice");
+{
+  const e = (over: Partial<Parameters<typeof eventSignature>[0]> = {}) => ({
+    type: "user_offer",
+    actor: "user",
+    payload: { amount: 155_000, note: "I am targeting 155k" },
+    at_ms: 12_000,
+    ...over,
+  });
+  check("the same event yields the same signature (a lost response is safe to retry)", eventSignature(e()) === eventSignature(e()));
+  check(
+    "JSON key order does not matter (jsonb does not preserve it)",
+    eventSignature(e({ payload: { note: "x", amount: 155_000 } })) ===
+      eventSignature(e({ payload: { amount: 155_000, note: "x" } })),
+  );
+  check(
+    "a different amount is a different event",
+    eventSignature(e({ payload: { amount: 156_000 } })) !== eventSignature(e()),
+  );
+  check(
+    "the same ask made later in the call is a different event",
+    eventSignature(e({ at_ms: 40_000 })) !== eventSignature(e()),
+  );
+  check(
+    "a different actor is a different event",
+    eventSignature(e({ actor: "opponent" })) !== eventSignature(e()),
+  );
+}
+
+console.log("\nAA. Ownership is explicit and the sample library is read-only");
+{
+  // The column is what actually prevents a recurrence: an unowned row could not
+  // be created even by a future code path, because the insert would fail.
+  const attemptCols = getTableColumns(attemptsTable);
+  const scenarioCols = getTableColumns(scenariosTable);
+  check(
+    "attempts.owner_id is NOT NULL, so no attempt can be unowned again",
+    attemptCols.owner_id.notNull === true,
+  );
+  check(
+    "scenarios.owner_id is NOT NULL, so the library cannot be anonymously deleted",
+    scenarioCols.owner_id.notNull === true,
+  );
+
+  const sample = { owner_id: DEMO_OWNER_ID };
+  const mine = { owner_id: "a".repeat(48) };
+  const theirs = { owner_id: "b".repeat(48) };
+  const allowed = (fn: () => void) => {
+    try {
+      fn();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // The four access cases the audit has to hold.
+  check("a cookie-less visitor sees ONLY sample data (read of a sample is allowed)", allowed(() => assertAttemptAccess(sample, null, "read")));
+  check("a fresh visitor cannot read another owner's attempt", !allowed(() => assertAttemptAccess(theirs, null, "read")));
+  check("the owner can read their own attempt", allowed(() => assertAttemptAccess(mine, mine.owner_id, "read")));
+  check("a foreign owner cannot read someone else's attempt", !allowed(() => assertAttemptAccess(mine, theirs.owner_id, "read")));
+  check("an owner id that is merely absent is not a grant", !allowed(() => assertAttemptAccess(mine, null, "read")));
+
+  // Samples are public to read but never writable — the demo library must not be
+  // destroyable, and a visitor must not be able to mutate a sample call.
+  check(
+    "nobody may WRITE a sample, not even with the sentinel as their identity",
+    !allowed(() => assertAttemptAccess(sample, null, "write")) &&
+      !allowed(() => assertAttemptAccess(sample, mine.owner_id, "write")),
+  );
+  check("an owner may still write their own attempt", allowed(() => assertAttemptAccess(mine, mine.owner_id, "write")));
+
+  // The sentinel must be unusable as a cookie identity (readOwnerId accepts only
+  // 48 lowercase hex characters, which this deliberately is not).
+  check("the demo sentinel cannot be minted or presented as an owner id", !/^[0-9a-f]{48}$/.test(DEMO_OWNER_ID));
+
+  const publicSample = toPublicScenario({
+    id: "00000000-0000-0000-0000-000000000000",
+    title: "t",
+    company: "c",
+    role: "r",
+    level: "l",
+    difficulty: "medium",
+    prep_pack: {},
+    owner_id: DEMO_OWNER_ID,
+    created_at: new Date(0),
+  } as never);
+  check("a sample scenario is labeled is_demo for the library UI", publicSample.is_demo === true);
+}
+
+console.log("\nAC. The acceptance predicate enforces the hard caps, not only the bar");
+{
+  const th = acceptanceThreshold(hidden);
+  const signCap = hidden.flex.sign_on_max ?? 0;
+  const eqCap = hidden.flex.equity_max ?? 0;
+  const cap = maxOfferTotal(hidden);
+
+  // The exploit this closes. `acceptsPackage` used to ask only "is the base at
+  // the bar, or the total at the total bar?", so `{base: 999999}` satisfied it:
+  // one `/offer` call with `accept_candidate_package` finalized an accepted
+  // attempt at a salary the band could never authorize.
+  check(
+    "the absurd package from the /offer exploit is refused",
+    !acceptsPackage(hidden, { base: 999_999, sign_on: 999_999, equity: 999_999 }),
+  );
+  check(
+    "base one dollar over the base budget is refused",
+    !acceptsPackage(hidden, { base: hidden.budget + 1, sign_on: 0, equity: 0 }),
+  );
+  check(
+    "base far over the budget is refused (it clears the base bar, which is not enough)",
+    !acceptsPackage(hidden, { base: hidden.budget + 80_000, sign_on: 0, equity: 0 }),
+  );
+  check(
+    "sign-on one dollar over its cap is refused",
+    !acceptsPackage(hidden, { base: th, sign_on: signCap + 1, equity: 0 }),
+  );
+  check(
+    "equity one dollar over its cap is refused",
+    !acceptsPackage(hidden, { base: th, sign_on: 0, equity: eqCap + 1 }),
+  );
+  // Every component inside its own cap, and the total still over the cap: the
+  // case a per-component check alone would have let through.
+  check(
+    "a total over maxOfferTotal is refused even with every component inside its cap",
+    !acceptsPackage(hidden, { base: hidden.budget, sign_on: signCap, equity: eqCap }) &&
+      hidden.budget + signCap + eqCap > cap,
+    `cap=${cap} sum=${hidden.budget + signCap + eqCap}`,
+  );
+  check(
+    "the base budget alone is accepted, so that boundary is reachable",
+    acceptsPackage(hidden, { base: hidden.budget, sign_on: 0, equity: 0 }) && hidden.budget >= th,
+  );
+  check("the authorization caps leave real room above the bar", cap > th, `cap=${cap} bar=${th}`);
+
+  const samples = [
+    { base: 999_999, sign_on: 0, equity: 0 },
+    { base: 0, sign_on: 0, equity: 0 },
+    { base: hidden.budget, sign_on: signCap, equity: eqCap },
+    { base: th, sign_on: 0, equity: 0 },
+    { base: hidden.budget, sign_on: signCap + 1, equity: 0 },
+  ];
+  check(
+    "no input makes acceptsPackage agree to a package outside the limits",
+    samples.every((p) => !acceptsPackage(hidden, p) || withinPackageLimits(hidden, p)),
+  );
+
+  const clamped = clampPackageToLimits(hidden, { base: 999_999, sign_on: 999_999, equity: 999_999 });
+  check("clamping an absurd package yields an authorized one", withinPackageLimits(hidden, clamped));
+  check(
+    "clamping never invents money",
+    total(clamped) <= total({ base: 999_999, sign_on: 999_999, equity: 999_999 }),
+  );
+  check(
+    "clamping a valid package returns it untouched",
+    total(clampPackageToLimits(hidden, { base: th, sign_on: 5_000, equity: 2_000 })) === th + 7_000,
+  );
+  check(
+    "clamping a base-only overshoot lands on the base budget",
+    clampPackageToLimits(hidden, { base: 500_000, sign_on: 0, equity: 0 }).base === hidden.budget,
+  );
+  const flexTrimmed = clampPackageToLimits(hidden, { base: hidden.budget, sign_on: signCap, equity: eqCap });
+  check(
+    "a total overshoot is trimmed from flex first, keeping the base intact",
+    flexTrimmed.base === hidden.budget && total(flexTrimmed) === cap,
+    `pkg=${JSON.stringify(flexTrimmed)} cap=${cap}`,
+  );
+}
+
+console.log("\nAD. A package beyond the band can never become an engine acceptance");
+{
+  // The recruiter sometimes IMPROVISES a package. It is mirrored onto the panel
+  // verbatim (the candidate heard it), and the engine records the inconsistency —
+  // but it must never be the package the engine agrees to.
+  const mirrored = { base: 260_000, sign_on: 30_000, equity: 9_000 };
+  const state = freshState();
+  applyRecruiterPackage(state, hidden, mirrored);
+  check("the improvised package really is outside the limits", !withinPackageLimits(hidden, mirrored));
+
+  const first = runTurn(state, "We have a deal at these terms. I accept.");
+  check(
+    "the recruiter does not accept the over-ceiling package the model spoke",
+    first.move.kind !== "accept",
+    `got ${first.move.kind}`,
+  );
+
+  // Insisting earns the yes — but on an AUTHORIZED package, not on the
+  // improvised figure. This branch used to `return {kind:"accept", package:
+  // state.currentOffer}` with no check at all.
+  const second = runTurn(state, "Come on, you said those numbers. I accept, okay, let's do it.");
+  check(
+    "the candidate's insisted yes is honoured",
+    second.move.kind === "accept",
+    `got ${second.move.kind}`,
+  );
+  if (second.move.kind === "accept") {
+    check(
+      "... on a package the company can actually authorize",
+      withinPackageLimits(hidden, second.move.package),
+      `pkg=${JSON.stringify(second.move.package)}`,
+    );
+    check(
+      "... never on the improvised figure",
+      second.move.package.base !== mirrored.base && total(second.move.package) <= maxOfferTotal(hidden),
+      `pkg=${JSON.stringify(second.move.package)}`,
+    );
+  }
+
+  // And the engine's own concessions keep every limit exact, so the strongest
+  // negotiation still ends in a deal rather than in a package it cannot accept.
+  const hard = freshState();
+  const lines = [
+    "Market data for this scope shows 205 to 240 and I have a signed offer at 238k.",
+    "I need 230000 base, 25000 sign-on and 25000 in annual equity.",
+    "The market supports 235 base plus full sign-on and equity — that is my number.",
+    "I want the top of the band: 240000 base, 30000 sign-on, 30000 equity.",
+    "Give me 245000 base, 30000 sign-on and 30000 equity or I walk away.",
+  ];
+  for (const line of lines) runTurn(hard, line);
+  check(
+    "the hardest negotiation still lands inside the limits",
+    withinPackageLimits(hidden, hard.currentOffer),
+    `pkg=${JSON.stringify(hard.currentOffer)}`,
+  );
+  const final = runTurn(hard, "Alright — I accept. We have a deal.");
+  check(
+    "and the deal it agrees to is one it can sign",
+    final.move.kind !== "accept" || withinPackageLimits(hidden, final.move.package),
+    `got ${final.move.kind}`,
+  );
+  if (final.move.kind === "accept") {
+    check("an engine acceptance clears the bar via the same predicate", acceptsPackage(hidden, final.move.package));
+  }
+}
+
+console.log("\nAE. A partial scenario edit is validated as the FINAL state");
+{
+  const stored: PrepPack = {
+    title: "Senior Backend Engineer",
+    context: "Late-stage startup, small team, shipping a payments platform.",
+    role: "Backend Engineer",
+    company: "EchoForge Studios",
+    comp_notes: ["Base is the tightest line", "Sign-on is workable"],
+    coaching_objective: "Anchor on scope and market data, never state a walk-away number.",
+    your_target: 165_000,
+    your_reservation: 150_000,
+  };
+  check(
+    "changing only the target below the stored walk-away is refused",
+    prepPackError(mergePrepPack(stored, { your_target: 100_000 })) !== null,
+  );
+  check(
+    "changing only the walk-away above the stored target is refused",
+    prepPackError(mergePrepPack(stored, { your_reservation: 200_000 })) !== null,
+  );
+  check(
+    "the same edit accepted when both fields arrive valid together",
+    prepPackError(mergePrepPack(stored, { your_target: 175_000, your_reservation: 140_000 })) === null,
+  );
+  check("an unchanged, valid prep pack is still valid", prepPackError(mergePrepPack(stored, {})) === null);
+  check(
+    "an out-of-range target is refused on the merged state",
+    prepPackError(mergePrepPack(stored, { your_target: 10_000 })) !== null,
+  );
+  check(
+    "blanking the context is refused",
+    prepPackError(mergePrepPack(stored, { context: "   " })) !== null,
+  );
+  check(
+    "emptying the comp notes is refused",
+    prepPackError(mergePrepPack(stored, { comp_notes: [] })) !== null,
+  );
+  check(
+    "a partial edit leaves the fields it did not name alone",
+    mergePrepPack(stored, { your_target: 175_000 }).context === stored.context &&
+      mergePrepPack(stored, { your_target: 175_000 }).your_reservation === stored.your_reservation,
+  );
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

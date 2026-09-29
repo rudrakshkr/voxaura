@@ -7,187 +7,344 @@ import {
   initialEngineState,
   serializeEngineState,
 } from "@/lib/engine-state";
-import { getAttemptWithScenario, insertEvents, setAttemptEngineState } from "@/lib/db/queries";
+import {
+  consumeAuthorizationTx,
+  insertEventsTx,
+  loadAttemptWithScenarioTx,
+  samePackage,
+  setAttemptEngineStateTx,
+  setAttemptOutcomeIfAcceptedTx,
+  withAttemptLock,
+} from "@/lib/db/queries";
 import { hydrateAttempt } from "@/lib/negotiation";
 import {
-  detectDeferral,
+  acceptsPackage,
   extractSpokenPackage,
+  packageAnomaly,
   reconcileSpokenPackage,
+  withinPackageLimits,
   type SpokenPackage,
 } from "@/lib/negotiation-engine";
+import { assertAttemptAccess, readOwnerId } from "@/lib/ownership";
 import { clampEventAtMs, type CompPackage } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
+const PackageSchema = z.object({
+  base: z.number().int().min(0).max(10_000_000),
+  sign_on: z.number().int().min(0).max(10_000_000).nullish(),
+  equity: z.number().min(0).max(10_000_000).nullish(),
+});
+
 const BodySchema = z
   .object({
-    agent_text: z.string().min(1).max(4000).nullish(),
+    agent_text: z.string().max(4000).nullish(),
     /**
-     * The structured arguments of an `offer_to_candidate` tool call. This path
-     * exists because the tool call used to set the panel directly on the client,
-     * bypassing the engine entirely — so a hallucinated package could reach the
-     * panel without the engine state (and the next directive's FACT line)
-     * learning about it.
+     * The structured arguments of an `offer_to_candidate` tool call.
+     *
+     * This is a CLAIM about what the recruiter said, not a decision: it only
+     * becomes an authoritative engine change when it exactly matches a
+     * single-use authorization the server issued for this attempt.
      */
-    package: z
-      .object({
-        base: z.number().int().min(0),
-        sign_on: z.number().int().min(0).nullish(),
-        equity: z.number().min(0).nullish(),
-      })
-      .nullish(),
+    package: PackageSchema.nullish(),
     /** Conditions/notes attached to the offer, shown on the panel. */
     conditions: z.array(z.string().min(1).max(160)).max(3).nullish(),
     /**
-     * Set by the `accept_user_offer` tool path: the recruiter has agreed to the
-     * candidate's package, so the deal is final and must be recorded as such.
-     * Without this a model-initiated acceptance left only a generic commitment
-     * event, and the report scored an agreed deal as a stalemate.
+     * The recruiter agreeing to the CANDIDATE's package. A REQUEST: the server
+     * re-evaluates the package against the authoritative economics AND requires a
+     * matching accept authorization, so a browser cannot manufacture a deal.
      */
-    accepted: z.boolean().default(false),
-    // Call-elapsed milliseconds. Clamped server-side before insert — see
-    // clampEventAtMs — because a naive client sending Date.now() epoch-millis
-    // would overflow the 4-byte integer column.
+    accept_candidate_package: PackageSchema.nullish(),
+    /**
+     * Proof, issued by `/turn`, that the server itself decided this exact
+     * recruiter action. Bound to the attempt, the action and the package.
+     */
+    authorization_token: z.string().min(16).max(200).nullish(),
+    // Call-elapsed milliseconds, clamped before insert (see clampEventAtMs): a
+    // naive client sending Date.now() epoch-millis would overflow the 4-byte
+    // integer column.
     at_ms: z.number().int().min(0).nullish(),
   })
-  .refine((b) => Boolean(b.agent_text) || Boolean(b.package), {
-    message: "agent_text or package is required",
-  });
+  .refine(
+    (b) =>
+      Boolean(b.agent_text) ||
+      Boolean(b.package) ||
+      Boolean(b.accept_candidate_package),
+    { message: "agent_text, package or accept_candidate_package is required" },
+  );
+
+/** Normalize a client-supplied package into whole dollars. */
+function cleanPackage(p: z.infer<typeof PackageSchema>): CompPackage {
+  return {
+    base: Math.round(p.base),
+    sign_on: p.sign_on != null ? Math.round(p.sign_on) : 0,
+    equity: p.equity != null ? Math.round(p.equity) : 0,
+  };
+}
+
+/** Build the package a spoken sentence implies, filling unspoken components. */
+function packageFromSpoken(spoken: SpokenPackage, cur: CompPackage): CompPackage {
+  return {
+    base: spoken.base ?? cur.base,
+    sign_on: spoken.sign_on ?? (cur.sign_on ?? 0),
+    equity: spoken.equity ?? (cur.equity ?? 0),
+  };
+}
 
 /**
  * Reconcile what the recruiter actually said (or called offer_to_candidate with)
- * against the authoritative economics.
+ * against the server's authorization.
  *
- * The voice model is directed to only speak engine-authorized numbers, but it
- * sometimes improvises a package — and once the candidate has HEARD those
- * numbers, the offer panel and the report must agree with the call. This route
- * parses the recruiter's utterance (or takes the tool-call package), folds it
- * into the server-side engine state by MIRRORING it: the panel shows exactly
- * what the recruiter said, the moment it said it. The engine state (and the next
- * directive's FACT line) adopts the spoken package so every later turn quotes
- * the same figures. A spoken figure beyond the approved band is not rewritten —
- * it becomes a scoring signal in the final report.
+ * The trust rule is now explicit, because the old one was exploitable: the
+ * browser can call this endpoint with any `package` or
+ * `accept_candidate_package`, so the ROUTE cannot treat that as truth. What the
+ * browser legitimately holds is the token `/turn` issued when the engine decided
+ * the move — bound to this attempt, this action and these exact figures. An
+ * authoritative mutation therefore requires a matching, unused, unexpired token;
+ * everything else is recorded as an OBSERVATION for the report and the panel, and
+ * changes no economics.
  *
- * It also reports whether the recruiter deferred the decision to an off-screen
- * team, which the call screen surfaces so the candidate can press for a real
- * answer instead of waiting on a promise that can never arrive.
+ * Two consequences worth stating:
+ * - A recruiter who improvises a package can no longer rewrite the engine state
+ *   from the browser. The deviation is written as a `voice_engine_inconsistency`
+ *   event (server-authored, scoring-relevant) and the panel is corrected to the
+ *   authoritative figures, so the audio, the panel and the settlement cannot
+ *   silently disagree.
+ * - An acceptance can only be recorded for a package the engine authorized, so
+ *   `accept_candidate_package: {base: 999999}` can never finalize an attempt.
  */
 export const POST = handle(
   async (req: Request, ctx: { params: Promise<{ id: string }> }) => {
     const { id } = await ctx.params;
     const body = BodySchema.safeParse(await req.json().catch(() => null));
-    if (!body.success) throw new ApiError(400, "agent_text or package is required");
+    if (!body.success) throw new ApiError(400, "Invalid offer payload");
 
-    const { attempt, scenario } = await getAttemptWithScenario(id);
-    const { effectiveHidden: hidden } = hydrateAttempt(attempt, scenario);
-    const state = deserializeEngineState(attempt.engine_state) ?? initialEngineState(hidden);
-
-    const text = body.data.agent_text?.trim() ?? "";
+    const ownerId = await readOwnerId();
     const atMs = clampEventAtMs(body.data.at_ms);
+    const text = body.data.agent_text?.trim() ?? "";
     const conditions = (body.data.conditions ?? [])
       .map((c) => c.trim())
       .filter((c) => c.length > 0)
       .slice(0, 3);
 
-    // 1. Spoken package (or structured tool-call package) → clamped, monotonic
-    //    engine package.
-    const spoken: SpokenPackage = body.data.package
-      ? {
-          base: body.data.package.base > 0 ? body.data.package.base : null,
-          sign_on: body.data.package.sign_on ?? null,
-          equity: body.data.package.equity ?? null,
-          total: null,
+    const result = await withAttemptLock(id, async (tx) => {
+      const { attempt, scenario } = await loadAttemptWithScenarioTx(tx, id);
+      assertAttemptAccess(attempt, ownerId, "write");
+
+      // An attempt the engine already settled is closed to mutations — but the
+      // recruiter's `accept_user_offer` tool call arrives immediately AFTER the
+      // turn that settled it, so a repeat of the SAME agreed package is answered
+      // idempotently instead of 409-ing (which would make the client show a
+      // spurious "not validated" notice on a deal that was in fact agreed).
+      if (attempt.status !== "active") {
+        const requestedAccept = body.data.accept_candidate_package
+          ? cleanPackage(body.data.accept_candidate_package)
+          : null;
+        const alreadyAgreed =
+          attempt.status === "completed" &&
+          attempt.outcome === "accepted" &&
+          attempt.final_offer != null;
+        if (alreadyAgreed && requestedAccept && samePackage(attempt.final_offer!, requestedAccept)) {
+          return {
+            offer: attempt.final_offer!,
+            changed: false,
+            correction: false,
+            authoritative: true,
+            notice: null,
+            conditions: null,
+            accepted: true,
+            accept_reason: null,
+            inconsistency_recorded: false,
+            deferral: null,
+          };
         }
-      : extractSpokenPackage(text);
-    const reconciled = reconcileSpokenPackage(hidden, state, spoken);
-
-    let standing: CompPackage = state.currentOffer;
-    const events: Parameters<typeof insertEvents>[1] = [];
-
-    if (reconciled) {
-      if (reconciled.changed) {
-        // The recruiter said a new package — that IS the package. It is mirrored
-        // verbatim onto the panel and folded into the engine state so the next
-        // directive's FACT line quotes the same figures. No clamping, no
-        // reshaping: a figure beyond the approved band is a scoring signal in
-        // the report, not a number the server silently rewrites.
-        applyRecruiterPackage(state, hidden, reconciled.pkg);
-        standing = reconciled.pkg;
+        throw new ApiError(409, "Attempt is no longer active");
       }
-      // Only a real change of package is worth logging — restating the same
-      // figures is not an event.
-      if (reconciled.changed) {
-        events.push({
-          type: "opponent_offer",
-          actor: "opponent",
-          source: "tool",
-          payload: {
-            package: standing,
-            spoken,
-            impact: "neutral",
-            note: "recruiter stated a package on the call",
-          },
-          at_ms: atMs,
+
+      const { effectiveHidden: hidden } = hydrateAttempt(attempt, scenario);
+      const state = deserializeEngineState(attempt.engine_state) ?? initialEngineState(hidden);
+
+      const spoken: SpokenPackage = body.data.package
+        ? {
+            base: body.data.package.base > 0 ? body.data.package.base : null,
+            sign_on: body.data.package.sign_on ?? null,
+            equity: body.data.package.equity ?? null,
+            total: null,
+          }
+        : extractSpokenPackage(text);
+      const reconciled = reconcileSpokenPackage(hidden, state, spoken);
+
+      const standingBefore: CompPackage = { ...state.currentOffer };
+      const events: Parameters<typeof insertEventsTx>[2] = [];
+      let notice: string | null = null;
+      let authoritative = false;
+      let accepted = false;
+      let acceptReason: string | null = null;
+      let inconsistency = false;
+
+      const requestedAccept = body.data.accept_candidate_package
+        ? cleanPackage(body.data.accept_candidate_package)
+        : null;
+      const action: "offer" | "accept" = requestedAccept ? "accept" : "offer";
+      const submitted: CompPackage | null = requestedAccept
+        ? requestedAccept
+        : reconciled
+          ? reconciled.pkg
+          : null;
+
+      let authorizationOk = false;
+      if (body.data.authorization_token && submitted) {
+        const consumed = await consumeAuthorizationTx(tx, {
+          attemptId: id,
+          token: body.data.authorization_token,
+          action,
+          package: submitted,
+          conditions,
         });
+        authorizationOk = consumed.ok;
+        if (!consumed.ok) {
+          console.warn(
+            `[offer] refused an unauthorized ${action} for attempt ${id}: ${consumed.reason}`,
+          );
+        }
       }
-    }
 
-    // 1b. An acceptance confirms the deal. The engine normally records this on
-    //     its own accept turn, but the voice model can call accept_user_offer
-    //     itself — and then nothing downstream knew a deal had been struck.
-    if (body.data.accepted) {
-      events.push({
-        type: "acceptance",
-        actor: "opponent",
-        source: "tool",
-        payload: {
-          package: standing,
-          impact: "strong",
-          note: "recruiter accepted the candidate's package",
-        },
-        at_ms: atMs,
-      });
-    }
 
-    // 2. Deferral → the engine now owes the candidate a real decision.
-    const deferred = detectDeferral(text);
-    const alreadyPending = state.pendingDecision;
-    if (deferred && !alreadyPending) {
-      state.pendingDecision = true;
-      events.push({
-        type: "pressure_tactic",
-        actor: "opponent",
-        source: "tool",
-        payload: {
-          impact: "risky",
-          note: "recruiter deferred the decision to an internal team",
-          quote: text.slice(0, 240),
-        },
-        at_ms: atMs,
-      });
-    }
+      if (authorizationOk && action === "accept" && submitted) {
+        // The engine already decided this acceptance, so the predicate must hold.
+        if (acceptsPackage(hidden, submitted)) {
+          applyRecruiterPackage(state, hidden, submitted);
+          accepted = true;
+          authoritative = true;
+          events.push({
+            type: "acceptance",
+            actor: "opponent",
+            source: "tool",
+            payload: {
+              package: submitted,
+              impact: "strong",
+              authorized: true,
+              note: "engine-validated acceptance of the candidate's package",
+            },
+            at_ms: atMs,
+          });
+        } else {
+          const overCaps = !withinPackageLimits(hidden, submitted);
+          acceptReason = overCaps
+            ? "the package is beyond what the band can authorize"
+            : "the base is below what the band can support";
+          events.push({
+            type: "voice_engine_inconsistency",
+            actor: "opponent",
+            source: "tool",
+            payload: {
+              impact: "risky",
+              note: "an authorized acceptance did not satisfy the hard caps",
+              requested: submitted,
+              standing: state.currentOffer,
+              over_caps: overCaps,
+            },
+            at_ms: atMs,
+          });
+          inconsistency = true;
+        }
+      } else if (authorizationOk && action === "offer" && submitted) {
+        // Authorized package. `/turn` normally already put it on the table (the
+        // engine owns the move), so this is usually a confirmation; it applies
+        // only if it genuinely differs, which keeps one move to one event.
+        const changed =
+          submitted.base !== state.currentOffer.base ||
+          (submitted.sign_on ?? 0) !== (state.currentOffer.sign_on ?? 0) ||
+          (submitted.equity ?? 0) !== (state.currentOffer.equity ?? 0);
+        if (changed) {
+          applyRecruiterPackage(state, hidden, submitted);
+          events.push({
+            type: "opponent_offer",
+            actor: "opponent",
+            source: "tool",
+            payload: {
+              package: submitted,
+              conditions: conditions.length > 0 ? conditions : null,
+              authorized: true,
+              note: "recruiter stated an engine-authorized package",
+            },
+            at_ms: atMs,
+          });
+        }
+        authoritative = true;
+      } else if (requestedAccept) {
+        // No valid authorization: NEVER complete the attempt on a browser
+        // assertion. The refusal is reported so the model can correct itself.
+        acceptReason =
+          "the agreement was not authorized by the negotiation engine for these exact figures";
+        notice =
+          "The platform did not authorize that agreement — the numbers were not confirmed.";
+      } else if (reconciled && reconciled.changed && submitted) {
+        // The recruiter said something the engine did not authorize. Correct the
+        // panel to the authoritative figures and change NO economics.
+        const { overCeiling, belowOpening } = packageAnomaly(hidden, submitted);
+        // A durable event is written when the figure is genuinely anomalous (an
+        // over-promise the candidate heard, which belongs in the report) or when
+        // a token was presented and did not match (a real server/browser
+        // disagreement about authorized numbers). A merely different, plausible
+        // figure with no token is corrected in the UI only — that case is what an
+        // ordinary reconciliation race looks like, and logging it would put a
+        // phantom "inconsistency" in the report for a legitimate offer.
+        inconsistency = overCeiling || belowOpening || Boolean(body.data.authorization_token);
+        if (inconsistency) {
+          events.push({
+            type: "voice_engine_inconsistency",
+            actor: "opponent",
+            source: "tool",
+            payload: {
+              impact: "risky",
+              note: "the recruiter spoke a package the engine did not authorize",
+              spoken: submitted,
+              previous: standingBefore,
+              over_ceiling: overCeiling,
+              below_opening: belowOpening,
+              unauthorized: true,
+            },
+            at_ms: atMs,
+          });
+        }
+        notice =
+          "The recruiter's spoken figure was not authorized by the negotiation engine; the offer panel shows the package actually on the table.";
+      }
 
-    if (reconciled?.changed || (deferred && !alreadyPending) || body.data.accepted) {
-      await setAttemptEngineState(id, serializeEngineState(state));
-      if (events.length > 0) await insertEvents(id, events);
-    }
-    if (body.data.accepted) {
-      const { setAttemptOutcomeIfAccepted } = await import("@/lib/db/queries");
-      await setAttemptOutcomeIfAccepted(id, standing, body.data.conditions ?? []);
-    }
+      // The browser may report what the recruiter said, but it must never be
+      // allowed to create an authoritative engine transition from that text.
+      // Recruiter deferral is decided by the authoritative `/turn` engine, not
+      // by an arbitrary client call to `/offer`.
+      const stateChanged =
+        accepted ||
+        state.currentOffer.base !== standingBefore.base ||
+        (state.currentOffer.sign_on ?? 0) !== (standingBefore.sign_on ?? 0) ||
+        (state.currentOffer.equity ?? 0) !== (standingBefore.equity ?? 0);
 
-    return Response.json({
-      offer: standing,
-      changed: reconciled?.changed ?? false,
-      adjusted: false,
-      previous: reconciled?.changed ? reconciled.previous : null,
-      notice: null,
-      conditions: conditions.length > 0 ? conditions : null,
-      deferral: {
-        outstanding: state.pendingDecision,
-        deferredNow: deferred,
-        quote: deferred ? text.slice(0, 240) : null,
-      },
+      await setAttemptEngineStateTx(tx, id, serializeEngineState(state));
+      if (events.length > 0) {
+        // Only the authorized path may write an economics event; a diagnostic
+        // inconsistency is server-authored too, so the whole batch is
+        // authoritative (no client-supplied claim reaches the scorer as fact).
+        await insertEventsTx(tx, id, events, { authoritative: true });
+      }
+      if (accepted) await setAttemptOutcomeIfAcceptedTx(tx, id, state.currentOffer, conditions);
+
+      return {
+        offer: state.currentOffer,
+        changed: stateChanged,
+        correction: inconsistency,
+        authoritative,
+        notice,
+        conditions: conditions.length > 0 ? conditions : null,
+        accepted,
+        accept_reason: acceptReason,
+        inconsistency_recorded: inconsistency,
+        deferral: null,
+      };
     });
+
+    return Response.json(result);
   },
 );

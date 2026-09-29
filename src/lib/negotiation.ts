@@ -1,6 +1,16 @@
-import { ApiError } from "./api";
 import type { AttemptRow, ScenarioRow } from "./db/queries";
 import { normalizeHidden, type HiddenState } from "./types";
+
+/**
+ * Attempt/scenario hydration.
+ *
+ * Economics live in exactly one place: `negotiation-engine.ts`. This module used
+ * to re-implement `acceptanceThreshold` with a slightly different formula
+ * (unrounded, so a dollar or two off the engine's), which is precisely how a
+ * panel and a directive end up disagreeing about the same scenario. The
+ * duplicate is gone: anything that needs the acceptance bar imports it from the
+ * engine.
+ */
 
 /** Reconstruct the base hidden state from scenario columns. */
 export function hiddenOf(scenario: ScenarioRow): HiddenState {
@@ -42,17 +52,4 @@ export function hydrateAttempt(attempt: AttemptRow, scenario: ScenarioRow): Hydr
     effectiveHidden,
     agentMode: attempt.agent_mode === "inline" ? "inline" : "stored",
   };
-}
-
-/**
- * The total-package level at which the recruiter accepts. Between target and
- * budget — deliberately above the target so creative packaging matters.
- */
-export function acceptanceThreshold(hidden: HiddenState): number {
-  return Math.round(hidden.target + (hidden.budget - hidden.target) * 0.55);
-}
-
-export function money(n: number | null | undefined): string {
-  if (n == null) return "—";
-  return n.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 }

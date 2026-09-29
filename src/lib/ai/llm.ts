@@ -18,6 +18,18 @@ export interface JsonCallArgs {
   schemaName: string;
   schema: Record<string, unknown>;
   temperature?: number;
+  /**
+   * Outer time budget for this call, in milliseconds.
+   *
+   * Completion has one deadline for the whole route, so each provider attempt is
+   * given the REMAINING time instead of the SDK's default 45s plus retries. A
+   * budget this small also disables the extra retry: a wrapped-up failed attempt
+   * cannot be completed inside what is left, so retrying only delays the
+   * degraded-report fallback the caller needs to produce a result at all.
+   */
+  timeoutMs?: number;
+  /** Absolute wall-clock deadline shared by every provider/fallback attempt. */
+  deadlineAt?: number;
 }
 
 export interface JsonCallResult {
@@ -126,6 +138,11 @@ function looksLikeSchemaRejection(err: unknown): boolean {
   );
 }
 
+function remainingBudget(args: JsonCallArgs): number | null {
+  if (args.deadlineAt != null) return Math.max(0, args.deadlineAt - Date.now());
+  return args.timeoutMs != null ? Math.max(0, args.timeoutMs) : null;
+}
+
 async function callProvider(p: Provider, args: JsonCallArgs): Promise<JsonCallResult> {
   const base = {
     model: p.model,
@@ -135,25 +152,44 @@ async function callProvider(p: Provider, args: JsonCallArgs): Promise<JsonCallRe
     ],
     temperature: args.temperature,
   };
+  // Use the remaining wall-clock budget, not the original timeout, so provider
+  // fallback and schema fallback share one deadline.
+  const timeoutMs = remainingBudget(args);
+  if (timeoutMs != null && timeoutMs <= 0) {
+    throw new Error("LLM completion budget exhausted");
+  }
+  const requestOpts = timeoutMs != null ? { timeout: timeoutMs, maxRetries: 0 } : {};
 
   try {
-    const res = await p.client.chat.completions.create({
-      ...base,
-      response_format: {
-        type: "json_schema",
-        json_schema: { name: args.schemaName, strict: false, schema: args.schema },
+    const res = await p.client.chat.completions.create(
+      {
+        ...base,
+        response_format: {
+          type: "json_schema",
+          json_schema: { name: args.schemaName, strict: false, schema: args.schema },
+        },
       },
-    });
+      requestOpts,
+    );
     const content = res.choices[0]?.message?.content;
     if (!content) throw new Error("empty response content");
     return { content, provider: p.name, model: p.model };
   } catch (err) {
     if (looksLikeSchemaRejection(err)) {
-      // Fall back to plain JSON-object mode on this provider.
-      const res = await p.client.chat.completions.create({
-        ...base,
-        response_format: { type: "json_object" },
-      });
+      // Fall back to plain JSON-object mode using whatever time remains in the
+      // SAME outer deadline. Never restart the provider's full timeout.
+      const fallbackTimeout = remainingBudget(args);
+      if (fallbackTimeout != null && fallbackTimeout <= 0) {
+        throw new Error("LLM completion budget exhausted");
+      }
+      const fallbackOpts =
+        fallbackTimeout != null
+          ? { timeout: fallbackTimeout, maxRetries: 0 }
+          : requestOpts;
+      const res = await p.client.chat.completions.create(
+        { ...base, response_format: { type: "json_object" } },
+        fallbackOpts,
+      );
       const content = res.choices[0]?.message?.content;
       if (!content) throw new Error("empty response content (json_object mode)");
       return { content, provider: p.name, model: p.model };
@@ -181,6 +217,7 @@ export async function callJson(args: JsonCallArgs): Promise<JsonCallResult> {
 
   const failures: string[] = [];
   for (const p of chain) {
+    if (args.deadlineAt != null && Date.now() >= args.deadlineAt) break;
     try {
       return await callProvider(p, args);
     } catch (err) {
@@ -191,6 +228,7 @@ export async function callJson(args: JsonCallArgs): Promise<JsonCallResult> {
       } else {
         console.warn(`[llm] ${p.name} call failed, trying next provider…`, err);
       }
+      if (args.deadlineAt != null && Date.now() >= args.deadlineAt) break;
     }
   }
 

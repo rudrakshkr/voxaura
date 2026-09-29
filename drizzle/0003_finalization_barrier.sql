@@ -1,0 +1,22 @@
+-- 0003 — the completion barrier.
+--
+-- `/complete` snapshots the attempt, scores it (an LLM call, deliberately
+-- outside any lock), and writes the report. Nothing used to stop a concurrent
+-- final turn from accepting the deal DURING that scoring window, after which
+-- completion wrote its stale outcome — `stalemate`, final offer null — over the
+-- accepted one. The candidate had agreed to a job and the report said the
+-- negotiation failed.
+--
+-- The fix is an explicit state rather than a timing assumption: completion moves
+-- the attempt to `finalizing` under the same advisory lock every mutation takes,
+-- and every mutating route requires `active`. Once the barrier is up, no turn,
+-- offer or event can change the state the report is being scored from, so the
+-- score, the evidence pointers, the replay and the history describe one call.
+--
+-- `finalizing_at` makes the barrier recoverable: a function killed mid-scoring
+-- would otherwise leave the attempt unfinishable, so a barrier older than
+-- FINALIZE_STALE_MS may be reclaimed.
+--
+-- Both statements are idempotent, so this file is safe to re-run.
+ALTER TYPE "public"."attempt_status" ADD VALUE IF NOT EXISTS 'finalizing' BEFORE 'abandoned';--> statement-breakpoint
+ALTER TABLE "attempts" ADD COLUMN IF NOT EXISTS "finalizing_at" timestamp with time zone;
