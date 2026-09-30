@@ -617,11 +617,12 @@ async function httpTests() {
     const ownerHistory = await histOf("A");
     const strangerHistory = await histOf("demoUser");
     check("a visitor's own attempts appear in their history", ownerHistory.some((r) => r.attempt_id === attemptOfA));
+    check("and their history holds only their own rows, never sample-labelled strangers' rows", ownerHistory.every((r) => r.is_demo === false));
     check(
       "and never in another visitor's history",
       !strangerHistory.some((r) => r.attempt_id === attemptOfA) && !strangerHistory.some((r) => r.scenario_id === scnA.id),
     );
-    check("a fresh, cookie-less visitor sees only sample-labelled history", (await histOf("anon")).every((r) => r.is_demo === true));
+    check("a fresh, cookie-less visitor starts with an empty history", (await histOf("anon")).length === 0);
 
     console.log("\nB4. A partial scenario edit is validated as the final state");
     check("foreign owner → 404", (await api(`/api/scenarios/${scnA.id}`, { method: "PATCH", body: { title: "hijack" }, as: "B" })).status === 404);

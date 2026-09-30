@@ -1153,6 +1153,18 @@ export async function getPreviousScore(
   return score == null ? null : Number(score);
 }
 
+/**
+ * The caller's attempt history, and nothing else.
+ *
+ * Deliberately STRICTLY owner-scoped: rows owned by the sample-library sentinel
+ * are no longer mixed in. Those rows predate per-visitor ownership (their NULL
+ * owner was migrated to the sentinel), so every new visitor saw a pile of
+ * strangers' attempts dressed up as "Sample" rows on their history page. The
+ * purge of pre-2026-09-29 attempts removed the existing rows, and scoping here
+ * to `owner_id = ownerId` is what guarantees no such row can ever show up again.
+ *
+ * No cookie means no history — never "everyone's history".
+ */
 export async function listHistory(ownerId: string | null = null): Promise<
   Array<{
     attempt: AttemptRow;
@@ -1169,19 +1181,12 @@ export async function listHistory(ownerId: string | null = null): Promise<
     .from(attempts)
     .innerJoin(scenarios, eq(attempts.scenario_id, scenarios.id))
     .leftJoin(reports, eq(reports.attempt_id, attempts.id))
-    // The caller's own attempts, plus the sample library — which is public BY
-    // DESIGN and labeled as a sample in the UI.
-    //
-    // A caller with no owner cookie therefore sees only explicitly demo-scoped
-    // data, never another visitor's history. (This used to fall through to an
-    // unscoped query when the cookie was absent, which handed a fresh browser
-    // profile the ids, outcomes, agreed figures and scores of every attempt in
-    // the database.)
-    .where(
-      ownerId
-        ? or(eq(attempts.owner_id, ownerId), eq(attempts.owner_id, DEMO_OWNER_ID))
-        : eq(attempts.owner_id, DEMO_OWNER_ID),
-    )
+    // Only the caller's own attempts. A caller with no owner cookie therefore
+    // sees an empty history, never another visitor's rows. (This used to fall
+    // through to an unscoped query when the cookie was absent, and later included
+    // the sample-library sentinel — both handed a fresh browser profile the ids,
+    // outcomes, agreed figures and scores of attempts that were not theirs.)
+    .where(ownerId ? eq(attempts.owner_id, ownerId) : sql`false`)
     .orderBy(desc(attempts.started_at))
     .limit(100);
 
