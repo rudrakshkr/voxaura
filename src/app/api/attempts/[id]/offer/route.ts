@@ -17,7 +17,6 @@ import {
 } from "@/lib/db/queries";
 import { hydrateAttempt } from "@/lib/negotiation";
 import {
-  acceptsPackage,
   extractSpokenPackage,
   packageAnomaly,
   reconcileSpokenPackage,
@@ -217,8 +216,12 @@ export const POST = handle(
 
 
       if (authorizationOk && action === "accept" && submitted) {
-        // The engine already decided this acceptance, so the predicate must hold.
-        if (acceptsPackage(hidden, submitted)) {
+        // The engine already decided this acceptance, so the only thing left to
+        // verify is that the company can authorize the package. The engine's own
+        // acceptance rule is the same check — the acceptance BAR is the
+        // recruiter's negotiating target, not a limit, and a candidate who says
+        // yes to a package inside the band is entitled to that yes.
+        if (withinPackageLimits(hidden, submitted)) {
           applyRecruiterPackage(state, hidden, submitted);
           accepted = true;
           authoritative = true;
@@ -235,10 +238,7 @@ export const POST = handle(
             at_ms: atMs,
           });
         } else {
-          const overCaps = !withinPackageLimits(hidden, submitted);
-          acceptReason = overCaps
-            ? "the package is beyond what the band can authorize"
-            : "the base is below what the band can support";
+          acceptReason = "the package is beyond what the band can authorize";
           events.push({
             type: "voice_engine_inconsistency",
             actor: "opponent",
@@ -248,7 +248,7 @@ export const POST = handle(
               note: "an authorized acceptance did not satisfy the hard caps",
               requested: submitted,
               standing: state.currentOffer,
-              over_caps: overCaps,
+              over_caps: true,
             },
             at_ms: atMs,
           });

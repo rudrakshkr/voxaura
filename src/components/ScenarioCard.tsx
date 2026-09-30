@@ -131,36 +131,35 @@ export function ScenarioCard({
         <Link href={`/scenario/${scenario.id}`} className="btn btn-primary flex-1 text-sm">
           Start call
         </Link>
-        {scenario.is_demo ? (
-          // The sample library is public and read-only. Saying so here is better
-          // than offering Edit/Delete and letting the server refuse: the data is
-          // shared demo material, not this visitor's scenario.
-          <span className="text-xs text-white/45">Sample · read-only</span>
-        ) : (
-          <>
-            <button
-              className="btn btn-ghost text-sm"
-              disabled={busy}
-              onClick={() => {
-                setDraft(toDraft(scenario));
-                setError(null);
-                setEditing(true);
-              }}
-            >
-              Edit
-            </button>
-            <button
-              className="btn btn-ghost text-sm text-red-300"
-              disabled={busy}
-              onClick={() => {
-                setError(null);
-                setConfirming(true);
-              }}
-            >
-              Delete
-            </button>
-          </>
+        {scenario.is_demo && (
+          // Labelled, not locked: the built-in library is starter material, so
+          // it can be edited and removed exactly like a scenario you built
+          // yourself. Only the label stays, so it is clear where it came from.
+          <span className="rounded border border-violet-400/30 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-violet-200/80">
+            Sample
+          </span>
         )}
+        <button
+          className="btn btn-ghost text-sm"
+          disabled={busy}
+          onClick={() => {
+            setDraft(toDraft(scenario));
+            setError(null);
+            setEditing(true);
+          }}
+        >
+          Edit
+        </button>
+        <button
+          className="btn btn-ghost text-sm text-red-300"
+          disabled={busy}
+          onClick={() => {
+            setError(null);
+            setConfirming(true);
+          }}
+        >
+          Delete
+        </button>
       </div>
 
       {error && !editing && <p className="text-xs text-red-300">{error}</p>}
@@ -169,7 +168,7 @@ export function ScenarioCard({
         <Modal title="Delete this scenario?" onClose={() => setConfirming(false)}>
           <p className="text-sm text-white/70">
             <span className="font-semibold text-white">{scenario.title}</span> will be removed from
-            your library
+            the library
             {attemptCount != null && attemptCount > 0
               ? `, along with ${attemptCount} attempt${attemptCount === 1 ? "" : "s"} and ${attemptCount === 1 ? "its report" : "their reports"}`
               : ""}

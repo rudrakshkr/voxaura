@@ -139,7 +139,10 @@ export function simulatePlan(hidden: HiddenState, plan: CounterfactualPlan): Cou
     }
     const close = closingOutcome(move);
     if (close) {
-      outcome = close;
+      // A confirmed decline is the candidate walking away, and the stored
+      // outcome enum has no `declined`: the closing reason is a client-side
+      // message, not a recorded verdict, so it collapses to walked_away.
+      outcome = close === "declined" ? "walked_away" : close;
       break;
     }
   }

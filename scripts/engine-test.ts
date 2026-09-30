@@ -12,6 +12,7 @@ import {
   acceptanceThreshold,
   acceptanceTotalThreshold,
   acceptsPackage,
+  buildDirective,
   clampPackageToLimits,
   classifyUserMove,
   closingOutcome,
@@ -39,7 +40,7 @@ import { runCounterfactuals } from "../src/lib/counterfactual";
 import { buildReplay } from "../src/lib/replay";
 import { CLIENT_REPORTABLE_EVENTS, attempts as attemptsTable, scenarios as scenariosTable } from "../src/lib/db/schema";
 import { getTableColumns } from "drizzle-orm";
-import { assertAttemptAccess, DEMO_OWNER_ID } from "../src/lib/access";
+import { assertAttemptAccess, assertScenarioAccess, DEMO_OWNER_ID } from "../src/lib/access";
 import { toPublicScenario } from "../src/lib/db/queries";
 import {
   BatchedEvent,
@@ -87,14 +88,17 @@ function total(p: { base: number; sign_on?: number | null; equity?: number | nul
 }
 
 // ---------------------------------------------------------------------------
-console.log("\nA. Weak negotiator (accepts quickly)");
+console.log("\nA. Weak negotiator (takes the opening offer)");
 {
   const state = freshState();
   const { move } = runTurn(state, "Sounds great, I accept the offer.");
-  check("premature accept is NOT accepted (offer below threshold)", move.kind !== "accept", `got ${move.kind}`);
-  check("recruiter counters instead", move.kind === "counter" || move.kind === "hold_firm", `got ${move.kind}`);
-  const pkg = (move as { package?: { base: number } }).package;
-  if (pkg) check("counter stays within budget", pkg.base <= hidden.budget);
+  check("a clear yes closes the deal", move.kind === "accept", `got ${move.kind}`);
+  check(
+    "on exactly the package that was on the table",
+    move.kind === "accept" && move.package.base === hidden.opening_anchor && total(move.package) === hidden.opening_anchor,
+    `got ${JSON.stringify(move.kind === "accept" ? move.package : null)}`,
+  );
+  check("and the recruiter never haggles against a yes", state.currentOffer.base === hidden.opening_anchor);
 }
 
 console.log("\nB. Strong negotiator (anchors with evidence, gathers info, trades)");
@@ -160,34 +164,71 @@ console.log("\nD. Leverage-heavy negotiator (competing offer)");
   }
 }
 
-console.log("\nE. Walk-away");
+console.log("\nE. Walk-away is only final once the candidate confirms it");
 {
   const state = freshState();
   runTurn(state, "What flexibility do you have on the base?");
   const r = runTurn(state, "I'm going to decline and accept the other offer. This isn't the right fit.");
   check("walk-away detected", r.classification.walkAwaySignal);
-  check("recruiter holds (no begging)", r.move.kind === "hold_firm" || r.move.kind === "recover_from_walkaway", `got ${r.move.kind}`);
-  if (r.move.kind === "recover_from_walkaway") {
-    check("recovery package within budget", r.move.package.base <= hidden.budget);
-  }
+  check("the first decline asks the candidate to confirm it", r.move.kind === "probe", `got ${r.move.kind}`);
+  check("and it does not close the call yet", closingOutcome(r.move) === null, `got ${closingOutcome(r.move)}`);
+  check("the confirmation question is a real question", typeof (r.move as { question?: string }).question === "string");
+  const r2 = runTurn(state, "Yes, I'm sure — I'm declining the offer.");
+  check("a confirmed decline closes the call as declined", closingOutcome(r2.move) === "declined", `got ${closingOutcome(r2.move)}`);
+  check("and it is a settled, final goodbye", r2.move.kind === "hold_firm" && r2.move.final === true, `got ${r2.move.kind}`);
+  const goodbye = buildDirective(r2.move, hidden, { standingOffer: state.currentOffer });
+  check("the closing directive accepts the decision", /declin/i.test(goodbye.verdict), goodbye.verdict);
+  check("and forbids re-opening the numbers", goodbye.allowedNumbers.length === 0);
+
+  // Re-engaging withdraws the confirmation: the next decline is confirmed again.
+  const state2 = freshState();
+  runTurn(state2, "Thanks for the time today.");
+  const d1 = runTurn(state2, "I'm going to decline, this isn't for me.");
+  check("a first decline asks for confirmation", d1.move.kind === "probe", `got ${d1.move.kind}`);
+  const back = runTurn(state2, "Actually, hold on — could you walk me through the equity again?");
+  check("a change of subject withdraws the confirmation", back.move.kind !== "hold_firm" || closingOutcome(back.move) === null, `got ${back.move.kind}`);
+  check("so nothing is closed", closingOutcome(back.move) === null, `got ${closingOutcome(back.move)}`);
+  const d2 = runTurn(state2, "No, I've decided — I'm declining the offer.");
+  check(
+    "and a second decline ends the call without asking again",
+    d2.move.kind === "hold_firm" && d2.move.final === true && closingOutcome(d2.move) === "declined",
+    `got ${d2.move.kind} / ${closingOutcome(d2.move)}`,
+  );
+
+  // The path the live call kept failing on: decline once, get the earned save
+  // attempt, decline again. The second decline must END the call.
+  const state3 = freshState();
+  runTurn(state3, "Market data for this scope shows 158 to 164, and I've shipped three billing platforms.");
+  const save = runTurn(state3, "Then I'll walk away and take the other offer.");
+  check("an earned first decline gets one save attempt", save.move.kind === "recover_from_walkaway", `got ${save.move.kind}`);
+  const quit = runTurn(state3, "No — I'm declining. I'm out.");
+  check("and declining again ends the call as declined", closingOutcome(quit.move) === "declined", `got ${quit.move.kind} / ${closingOutcome(quit.move)}`);
 }
 
-console.log("\nF. Acceptance threshold integrity");
+console.log("\nE2. A decline is not the deadlock close");
+{
+  const state = freshState();
+  runTurn(state, "Thanks for the time today.");
+  runTurn(state, "I'm declining, this isn't the right fit.");
+  const confirmed = runTurn(state, "Yes, I'm sure, I'm declining.");
+  check("a confirmed decline reports declined, not stalemate", closingOutcome(confirmed.move) === "declined", `got ${closingOutcome(confirmed.move)}`);
+}
+
+console.log("\nF. A yes closes on the package on the table");
 {
   check("threshold between target and budget", threshold >= hidden.target && threshold <= hidden.budget, `threshold=${threshold} target=${hidden.target} budget=${hidden.budget}`);
 
-  // Only a package near/above threshold can be accepted.
+  // The bar is the recruiter's own negotiating target, not a limit on what a
+  // candidate may accept: saying yes to any package inside the band settles it.
   const state = freshState();
-  // Force the current offer above threshold via strong evidence path.
   for (let i = 0; i < 6; i++) {
     runTurn(state, "Signed competing offer in hand with a deadline — market data for my specialty supports 158000, and my track record de-risks your launch.");
   }
+  const onTable = total(state.currentOffer);
   const { move } = runTurn(state, "We have a deal at these terms. I accept.");
-  if (move.kind === "accept") {
-    check("accepted package ≥ threshold − tolerance", total(move.package) >= threshold - 4000, `total=${total(move.package)} threshold=${threshold}`);
-  } else {
-    check("premature close still not accepted above threshold test (informational)", true);
-  }
+  check("the yes closes the deal", move.kind === "accept", `got ${move.kind}`);
+  check("on exactly the package that was on the table", move.kind === "accept" && total(move.package) === onTable, `got ${move.kind === "accept" ? total(move.package) : null} vs ${onTable}`);
+  check("and that package is one the company can authorize", move.kind === "accept" && withinPackageLimits(hidden, move.package));
 }
 
 console.log("\nG. Hidden-state leakage guard (allowed numbers)");
@@ -294,7 +335,10 @@ console.log("\nK. Walk-away bluffs are not paid");
   const r1 = runTurn(state, "I'm going to walk away unless you do better.");
   check("an opening bluff gets a probe, not money", r1.move.kind === "probe", `got ${r1.move.kind}`);
   const r2 = runTurn(state, "Seriously, I'm out.");
-  check("a repeated bluff gets a firm hold", r2.move.kind === "hold_firm" && r2.move.final === true, `got ${r2.move.kind}`);
+  // The second walk-away is no longer read as a bluff: it is the answer to the
+  // confirmation the first one earned, so the call ends.
+  check("a repeated bluff is taken as final", r2.move.kind === "hold_firm" && r2.move.final === true, `got ${r2.move.kind}`);
+  check("and it closes as declined", closingOutcome(r2.move) === "declined", `got ${closingOutcome(r2.move)}`);
   check("no concession for the bluff", state.currentOffer.base === hidden.opening_anchor);
 
   // But a walk-away after real engagement is treated as one best-and-final move.
@@ -381,14 +425,33 @@ console.log("\nO. Classification edge cases");
   check("'okay, deal' is a commitment", classifyUserMove("Okay, deal.").commitmentSignal === true);
 }
 
-console.log("\nP. Insisting on a yes is honoured; a lowball yes is not capitulated to");
+console.log("\nP. A yes is answered with a deal, never with another counter");
 {
+  // Explicit acceptance.
   const state = freshState();
   const r1 = runTurn(state, "Okay, deal — I'll take what you offered.");
-  check("a premature yes is not accepted at the opening anchor", r1.move.kind !== "accept", `got ${r1.move.kind}`);
-  check("the recruiter improves slightly instead", r1.move.kind === "counter", `got ${r1.move.kind}`);
-  const r2 = runTurn(state, "We have a deal at those terms.");
-  check("a second yes closes the deal", r2.move.kind === "accept", `got ${r2.move.kind}`);
+  check("an explicit yes to the opening package closes the deal", r1.move.kind === "accept", `got ${r1.move.kind}`);
+  check("at exactly the package on the table", r1.move.kind === "accept" && r1.move.package.base === hidden.opening_anchor);
+
+  // Acceptance of an improved package.
+  const state2 = freshState();
+  runTurn(state2, "Market data for this scope shows 158 to 164, and I've shipped three billing platforms.");
+  const onTable = { ...state2.currentOffer };
+  const r2 = runTurn(state2, "Yes, that works for me — let's do it.");
+  check("a yes after an improved offer closes on that package", r2.move.kind === "accept", `got ${r2.move.kind}`);
+  check("and the deal is the exact package that was offered", r2.move.kind === "accept" && total(r2.move.package) === total(onTable), `got ${r2.move.kind === "accept" ? total(r2.move.package) : null} vs ${total(onTable)}`);
+
+  // A BARE yes is an acceptance only when an offer is what it answers.
+  const bare = runTurn(state2, "Yes.");
+  check("a bare yes right after an offer is an acceptance too", bare.move.kind === "accept" || state2.currentOffer.base === onTable.base, `got ${bare.move.kind}`);
+
+  const state3 = freshState();
+  runTurn(state3, "I want 190000.");
+  runTurn(state3, "I want 190000.");
+  const holding = runTurn(state3, "I want 190000.");
+  check("the recruiter is holding firm, not offering", holding.move.kind === "hold_firm", `got ${holding.move.kind}`);
+  const bare3 = runTurn(state3, "Yes.");
+  check("a bare yes while the recruiter is only holding is not an acceptance", bare3.move.kind !== "accept", `got ${bare3.move.kind}`);
 }
 
 console.log("\nQ. Only a genuinely worked-over deadlock closes the call");
@@ -398,7 +461,9 @@ console.log("\nQ. Only a genuinely worked-over deadlock closes the call");
   const state = freshState();
   runTurn(state, "Hello, thanks for taking the time.");
   const walk = runTurn(state, "I'm out — I'll walk away.");
-  check("a walk-away with no recovery left closes as walked_away", closingOutcome(walk.move) === "walked_away", `got ${closingOutcome(walk.move)}`);
+  check("an unconfirmed walk-away does not close the call", closingOutcome(walk.move) === null, `got ${closingOutcome(walk.move)}`);
+  const walk2 = runTurn(state, "Yes — I'm done. I'm walking away.");
+  check("a confirmed walk-away closes as declined", closingOutcome(walk2.move) === "declined", `got ${closingOutcome(walk2.move)}`);
 
   // Early in a call, a firm hold never ends it — however frustrated either side is.
   const early = freshState();
@@ -740,7 +805,7 @@ console.log("\nAB. A retried event batch cannot be recorded twice");
   );
 }
 
-console.log("\nAA. Ownership is explicit and the sample library is read-only");
+console.log("\nAA. Ownership is explicit; samples are readable, attempt-write-protected and scenario-editable");
 {
   // The column is what actually prevents a recurrence: an unowned row could not
   // be created even by a future code path, because the insert would fail.
@@ -751,7 +816,7 @@ console.log("\nAA. Ownership is explicit and the sample library is read-only");
     attemptCols.owner_id.notNull === true,
   );
   check(
-    "scenarios.owner_id is NOT NULL, so the library cannot be anonymously deleted",
+    "scenarios.owner_id is NOT NULL, so every scenario still has an owner row",
     scenarioCols.owner_id.notNull === true,
   );
 
@@ -774,14 +839,28 @@ console.log("\nAA. Ownership is explicit and the sample library is read-only");
   check("a foreign owner cannot read someone else's attempt", !allowed(() => assertAttemptAccess(mine, theirs.owner_id, "read")));
   check("an owner id that is merely absent is not a grant", !allowed(() => assertAttemptAccess(mine, null, "read")));
 
-  // Samples are public to read but never writable — the demo library must not be
-  // destroyable, and a visitor must not be able to mutate a sample call.
+  // A sample ATTEMPT is public to read and never writable: there is no way to
+  // know who ran it, so nobody gets to mutate a demo call.
   check(
-    "nobody may WRITE a sample, not even with the sentinel as their identity",
+    "nobody may WRITE a sample attempt, not even with the sentinel as their identity",
     !allowed(() => assertAttemptAccess(sample, null, "write")) &&
       !allowed(() => assertAttemptAccess(sample, mine.owner_id, "write")),
   );
   check("an owner may still write their own attempt", allowed(() => assertAttemptAccess(mine, mine.owner_id, "write")));
+
+  // Scenarios are the deliberate exception: the sample library is the material
+  // the product ships with, so it is editable and removable like any other
+  // scenario — that rule lives in `assertScenarioAccess` (covered in the
+  // integration suite, which runs it against real rows).
+  check(
+    "a sample SCENARIO is writable by any visitor",
+    allowed(() => assertScenarioAccess({ owner_id: DEMO_OWNER_ID }, null, "write")) &&
+      allowed(() => assertScenarioAccess({ owner_id: DEMO_OWNER_ID }, mine.owner_id, "write")),
+  );
+  check(
+    "and a foreign owner still cannot touch someone else's custom scenario",
+    !allowed(() => assertScenarioAccess(mine, theirs.owner_id, "write")),
+  );
 
   // The sentinel must be unusable as a cookie identity (readOwnerId accepts only
   // 48 lowercase hex characters, which this deliberately is not).
@@ -942,7 +1021,7 @@ console.log("\nAD. A package beyond the band can never become an engine acceptan
     `got ${final.move.kind}`,
   );
   if (final.move.kind === "accept") {
-    check("an engine acceptance clears the bar via the same predicate", acceptsPackage(hidden, final.move.package));
+    check("an engine acceptance is always a package the company can authorize", withinPackageLimits(hidden, final.move.package));
   }
 }
 

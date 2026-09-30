@@ -184,12 +184,13 @@ mic ──AudioWorklet(24kHz PCM16)──> wss://agents.assemblyai.com ──> S
 - Anonymous ownership: an httpOnly `voxaura_owner` cookie is minted per visitor and checked on every
   attempt-scoped route. The cookie is validated against the shape we mint (48 hex characters), so a
   forged value — including the `demo:sample-library` sentinel — cannot be presented as an identity.
-- Reads and writes are different privileges (see `src/lib/access.ts`). Sample rows are public to read
-  and refuse writes with a 403; everything else is creator-only and answers 404, so a probe cannot
-  learn that an id exists.
+- Reads and writes are different privileges (see `src/lib/access.ts`). Sample ATTEMPTS are public to
+  read and refuse writes with a 403 — a demo call has no provable author, so it stays immutable.
+  Custom attempts are creator-only and answer 404, so a probe cannot learn that an id exists.
 - Scenarios carry the same owner: `DELETE /api/scenarios/:id` cascades to every attempt, event and
-  report made against it, so it is creator-only, and the sample library is read-only to everyone — an
-  anonymous visitor can no longer delete a library scenario and take every attempt with it.
+  report made against it, so a custom scenario is creator-only. The built-in sample library is the
+  deliberate exception — it is the material the product ships with, so any visitor may edit or delete
+  a sample scenario (the UI labels it `Sample`), and `npm run seed` restores the library.
 - Authoritative events are server-generated only. The client may report what the candidate did; a
   browser cannot fabricate an opponent offer, an acceptance, or scoring evidence — client-observed
   events are stored flagged non-authoritative and are excluded from scoring, and a candidate

@@ -503,6 +503,8 @@ export function useVoiceAgent(args: {
   const closePollRef = useRef<number | null>(null);
   /** Set once a deal is agreed; makes the acceptance hang-up uncancellable. */
   const acceptCloseRef = useRef(false);
+  /** Set once a decline has been CONFIRMED; makes that hang-up uncancellable too. */
+  const declineCloseRef = useRef(false);
 
   // Duplicate-turn guards. A repeated finalisation used to print the recruiter's
   // sentence twice AND get re-parsed as a fresh offer, which is how the panel
@@ -584,13 +586,16 @@ export function useVoiceAgent(args: {
           return;
         }
         const heardReply = replyDoneSeqRef.current > armSeq;
+        // An agreed deal and a confirmed decline are both final decisions, so
+        // both skip the "is the candidate still talking?" check — nothing they
+        // say after confirming can add a turn to wait for.
+        const finalClose = acceptCloseRef.current || declineCloseRef.current;
         const busy =
           agentSpeakingRef.current ||
           playback.remainingMs() > 0 ||
           // A deadlock close also waits for the candidate: nothing they said may
-          // be left unanswered. (An agreed deal is final and skips this.)
-          (!acceptCloseRef.current &&
-            (turnInFlightRef.current || pendingTurnsRef.current.length > 0));
+          // be left unanswered.
+          (!finalClose && (turnInFlightRef.current || pendingTurnsRef.current.length > 0));
         if (heardReply && !busy) {
           if (idleSince === 0) idleSince = Date.now();
           else if (Date.now() - idleSince >= CLOSE_QUIET_MS) {
@@ -617,7 +622,9 @@ export function useVoiceAgent(args: {
    * If there is still something to say, there is still something to negotiate.
    */
   const cancelPendingClose = useCallback(() => {
-    if (acceptCloseRef.current) return; // the deal is agreed; the call is over
+    // An agreed deal or a confirmed decline is a decision, not a topic: the
+    // call is over and nothing said afterwards re-opens it.
+    if (acceptCloseRef.current || declineCloseRef.current) return;
     stopClosePoll();
     if (closingRef.current && !endedByUsRef.current) {
       closingRef.current = false;
@@ -648,6 +655,28 @@ export function useVoiceAgent(args: {
   }, [patch, stopClosePoll]);
   const armAcceptCloseRef = useRef(armAcceptClose);
   armAcceptCloseRef.current = armAcceptClose;
+
+  /**
+   * The candidate has confirmed they are declining: the deal is off and the call
+   * ends. Mirrors `armAcceptClose` exactly, and for the same reason — a
+   * confirmed decision is not a discussion. The waiter still holds the line open
+   * until the recruiter has finished the closing sentence and the audio has
+   * drained, so the hang-up lands after the goodbye rather than on top of it.
+   */
+  const armDeclineClose = useCallback(() => {
+    if (declineCloseRef.current || endedByUsRef.current) return;
+    declineCloseRef.current = true;
+    // Supersede a close already armed for a deadlock: the reason has changed, so
+    // the banner and the message have to say "declined" instead.
+    if (closingRef.current) {
+      stopClosePoll();
+      closingRef.current = false;
+      patch({ dealClosed: null });
+    }
+    closeCallRef.current("declined");
+  }, [patch, stopClosePoll]);
+  const armDeclineCloseRef = useRef(armDeclineClose);
+  armDeclineCloseRef.current = armDeclineClose;
 
   /**
    * Promote a new authoritative package, keeping the previous one for deltas.
@@ -1127,11 +1156,11 @@ export function useVoiceAgent(args: {
   /** Dispatch every queued turn, newest last; safe to call from anywhere. */
   const pumpTurnQueue = useCallback(() => {
     if (turnInFlightRef.current) return;
-    if (acceptCloseRef.current) {
-      // The deal is agreed: `/turn` has already closed the attempt, so a later
-      // utterance would only be refused (409) and retried in a loop. The
-      // sentence still reaches the transcript; there is simply nothing left to
-      // negotiate.
+    if (acceptCloseRef.current || declineCloseRef.current) {
+      // The deal is agreed or confirmed-declined: for an accepted deal `/turn`
+      // has already closed the attempt, so a later utterance would only be
+      // refused (409) and retried in a loop. The sentence still reaches the
+      // transcript; there is simply nothing left to negotiate.
       pendingTurnsRef.current = [];
       return;
     }
@@ -1221,6 +1250,12 @@ export function useVoiceAgent(args: {
         // A mere `final` hold is just "that's my best" and never ends the call,
         // so the candidate can still accept or bring something new.
         pendingCloseRef.current = data?.close ?? null;
+        // A CONFIRMED decline ends the call as surely as an agreed deal does.
+        // Arming here (rather than waiting for the recruiter's reply to finish)
+        // makes the hang-up uncancellable and bounded: the waiter still waits
+        // for the closing line to land, and the ceiling stops a wedged reply
+        // from leaving the caller on a dead line forever.
+        if (data?.close === "declined") armDeclineCloseRef.current();
         // The server's proof that this turn authorized a recruiter action. The
         // tool call that follows presents it, so a browser cannot invent an
         // offer or an acceptance. A turn that authorizes nothing clears it.
@@ -1847,6 +1882,7 @@ export function useVoiceAgent(args: {
     pendingCloseRef.current = null;
     closingRef.current = false;
     acceptCloseRef.current = false;
+    declineCloseRef.current = false;
     abuseWarnedRef.current = false;
     replyDoneSeqRef.current = 0;
     stopClosePoll();
@@ -1893,6 +1929,7 @@ export function useVoiceAgent(args: {
     pendingCloseRef.current = null;
     closingRef.current = false;
     acceptCloseRef.current = false;
+    declineCloseRef.current = false;
     stopClosePoll();
     patch({
       status: "ended",
@@ -1953,6 +1990,7 @@ export function useVoiceAgent(args: {
     pendingCloseRef.current = null;
     closingRef.current = false;
     acceptCloseRef.current = false;
+    declineCloseRef.current = false;
     abuseWarnedRef.current = false;
     replyDoneSeqRef.current = 0;
     stopClosePoll();

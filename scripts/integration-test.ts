@@ -20,9 +20,9 @@
 import "dotenv/config";
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 
-import { assertScenarioAccess, DEMO_OWNER_ID } from "../src/lib/access";
+import { assertAttemptAccess, assertScenarioAccess, DEMO_OWNER_ID } from "../src/lib/access";
 import { agentReleaseAllowed, INLINE_AGENT_SENTINEL, isStoredAgentId } from "../src/lib/agent-lifecycle";
 import { db } from "../src/lib/db/client";
 import {
@@ -144,7 +144,7 @@ async function dbTests() {
   console.log("\nA1. Library visibility is owner-scoped, not global");
   const scnA = await fixture("A", OWNER_A);
   const scnB = await fixture("B", OWNER_B);
-  const scnDemo = await fixture("Sample", DEMO_OWNER_ID);
+  const scnDemo = await fixture("DemoLibrary", DEMO_OWNER_ID);
 
   const anonList = await listScenariosWithCounts(null);
   check(
@@ -173,7 +173,16 @@ async function dbTests() {
     }
   };
   check("a visitor may READ a sample scenario", allowed(() => assertScenarioAccess(rowDemo, null, "read")));
-  check("a visitor may not WRITE a sample scenario", !allowed(() => assertScenarioAccess(rowDemo, null, "write")));
+  check(
+    "a visitor may also EDIT a sample scenario (the library is starter material, not a locked exhibit)",
+    allowed(() => assertScenarioAccess(rowDemo, null, "write")) &&
+      allowed(() => assertScenarioAccess(rowDemo, OWNER_B, "write")),
+  );
+  check(
+    "but a sample ATTEMPT stays read-only — nobody can mutate a demo call",
+    allowed(() => assertAttemptAccess({ owner_id: DEMO_OWNER_ID }, null, "read")) &&
+      !allowed(() => assertAttemptAccess({ owner_id: DEMO_OWNER_ID }, DEMO_OWNER_ID, "write")),
+  );
   check("anyone may use a sample scenario to start an attempt", allowed(() => assertScenarioAccess(rowDemo, OWNER_B, "read")));
   check(
     "the owner may read and write their own scenario",
@@ -563,7 +572,10 @@ async function waitForServer(child: ChildProcess): Promise<boolean> {
 async function httpTests() {
   const scnA = await fixture("HTTP-A", OWNER_A);
   const scnB = await fixture("HTTP-B", OWNER_B);
-  const scnDemo = await fixture("HTTP-Sample", DEMO_OWNER_ID);
+  const scnDemo = await fixture("HTTP-DemoLibrary", DEMO_OWNER_ID);
+  // A second demo row, dedicated to the edit/delete assertions: removing it must
+  // not pull the scenario the rest of the suite still runs calls against.
+  const scnDemoEdit = await fixture("HTTP-DemoRemove", DEMO_OWNER_ID);
   jars.set("A", `voxaura_owner=${OWNER_A}`);
   jars.set("B", `voxaura_owner=${OWNER_B}`);
   jars.set("forged", `voxaura_owner=${DEMO_OWNER_ID}`);
@@ -638,8 +650,12 @@ async function httpTests() {
     const newPrep = ((await api(`/api/scenarios/${scnA.id}`, { as: "A" })).json.scenario as { prep_pack: PrepPack }).prep_pack;
     check("and it persists, leaving the untouched fields intact", newPrep.your_target === 175_000 && newPrep.your_reservation === 140_000 && newPrep.context === prep("HTTP-A").context);
     check("an unchanged, valid scenario accepts a no-op edit", (await api(`/api/scenarios/${scnA.id}`, { method: "PATCH", body: {}, as: "A" })).status === 200);
-    check("a sample scenario stays read-only", (await api(`/api/scenarios/${scnDemo.id}`, { method: "PATCH", body: { title: "nope" }, as: "A" })).status === 403);
-    check("a sample scenario cannot be deleted", (await api(`/api/scenarios/${scnDemo.id}`, { method: "DELETE", as: "A" })).status === 403);
+    // The sample library is editable and removable like any other scenario: it
+    // is the material the product ships with, not an exhibit nobody can touch.
+    check("a sample scenario can be EDITED", (await api(`/api/scenarios/${scnDemoEdit.id}`, { method: "PATCH", body: { title: "Edited sample" }, as: "A" })).status === 200);
+    check("and the edit sticks", (await api(`/api/scenarios/${scnDemoEdit.id}`, { as: "anon" })).json.scenario != null && ((await api(`/api/scenarios/${scnDemoEdit.id}`, { as: "anon" })).json.scenario as { title: string }).title === "Edited sample");
+    check("a sample scenario can be DELETED", (await api(`/api/scenarios/${scnDemoEdit.id}`, { method: "DELETE", as: "A" })).status === 200);
+    check("and it is really gone", (await api(`/api/scenarios/${scnDemoEdit.id}`, { as: "A" })).status === 404);
     check("a foreign scenario cannot be deleted", (await api(`/api/scenarios/${scnA.id}`, { method: "DELETE", as: "B" })).status === 404);
 
     console.log("\nB5. A browser cannot manufacture an offer or an acceptance");
@@ -839,7 +855,15 @@ async function httpTests() {
     if (speakId) createdAttemptIds.push(speakId);
     await api(`/api/attempts/${speakId}/offer`, { method: "POST", body: { package: { base: 260_000, sign_on: 30_000, equity: 9_000 } }, as: "demoUser" });
     const firstYes = await api(`/api/attempts/${speakId}/turn`, { method: "POST", body: { user_text: "We have a deal at those numbers. I accept." }, as: "demoUser" });
-    check("the recruiter does not accept the improvised package", firstYes.json.verdict !== "accepted", String(firstYes.json.verdict));
+    // The candidate's yes is honoured — but on the package the ENGINE has on the
+    // table, which the improvised spoken figure never became.
+    const standing = firstYes.json.standing as { base: number; sign_on?: number | null; equity?: number | null } | null;
+    check(
+      "a yes is answered with a deal on a package the company can authorize",
+      firstYes.json.verdict === "accepted" && standing != null && withinPackageLimits(BAND, standing),
+      JSON.stringify({ verdict: firstYes.json.verdict, standing }),
+    );
+    check("and never on the improvised figure the model spoke", standing != null && standing.base !== 260_000, JSON.stringify(standing));
     await api(`/api/attempts/${speakId}/turn`, { method: "POST", body: { user_text: "Come on, you said those numbers. Okay, I accept, let's do it." }, as: "demoUser" });
     const spokeState = (await api(`/api/attempts/${speakId}`, { as: "demoUser" })).json.attempt as {
       outcome: string | null;
@@ -1301,6 +1325,64 @@ async function httpTests() {
       provReport.events.filter((e) => e.type === "leverage_introduced").every((e) => !e.authoritative),
     );
 
+    console.log("\nB18. A decline ends the call only once the candidate confirms it");
+    const decJar = "declineUser";
+    const decStart = await api("/api/attempts", { method: "POST", body: { scenario_id: scnDemo.id }, as: decJar });
+    const decId = decStart.json.attempt_id as string;
+    if (decId) createdAttemptIds.push(decId);
+    await api(`/api/attempts/${decId}/turn`, {
+      method: "POST",
+      body: { user_text: "Thanks for taking the time today.", turn_id: "decline-turn-0" },
+      as: decJar,
+    });
+    const decline1 = await api(`/api/attempts/${decId}/turn`, {
+      method: "POST",
+      body: { user_text: "I'm going to decline — this just isn't the right fit for me.", turn_id: "decline-turn-1" },
+      as: decJar,
+    });
+    check(
+      "the first decline asks for confirmation instead of ending the call",
+      decline1.json.close == null && decline1.json.verdict === "probe",
+      JSON.stringify({ close: decline1.json.close, verdict: decline1.json.verdict }),
+    );
+    check(
+      "and the confirmation question is actually put to the candidate",
+      typeof (decline1.json.directive as { askUserQuestion?: string | null } | undefined)?.askUserQuestion ===
+        "string" &&
+        ((decline1.json.directive as { askUserQuestion: string }).askUserQuestion.length > 0),
+      JSON.stringify((decline1.json.directive as { askUserQuestion?: string | null })?.askUserQuestion),
+    );
+    const decline2 = await api(`/api/attempts/${decId}/turn`, {
+      method: "POST",
+      body: { user_text: "Yes, I'm sure — I'm declining the offer.", turn_id: "decline-turn-2" },
+      as: decJar,
+    });
+    check(
+      "a confirmed decline closes the call as declined",
+      decline2.json.close === "declined",
+      JSON.stringify({ close: decline2.json.close, verdict: decline2.json.verdict }),
+    );
+    check(
+      "and the closing directive tells the recruiter to accept the decision",
+      /declin/i.test(String((decline2.json.directive as { verdict?: string } | undefined)?.verdict)),
+      JSON.stringify((decline2.json.directive as { verdict?: string } | undefined)?.verdict),
+    );
+    const decComplete = await api(`/api/attempts/${decId}/complete`, {
+      method: "POST",
+      body: {
+        transcript: [
+          { role: "user", text: "I'm going to decline — this just isn't the right fit for me." },
+          { role: "user", text: "Yes, I'm sure — I'm declining the offer." },
+        ],
+      },
+      as: decJar,
+    });
+    check(
+      "a declined call is scored as walked_away, the server's own record",
+      decComplete.status === 200 && decComplete.json.outcome === "walked_away",
+      JSON.stringify({ status: decComplete.status, outcome: decComplete.json.outcome }),
+    );
+
     check("the band is what the fixtures actually used", CAP === 189_250 && THRESHOLD === 173_250, `cap=${CAP} bar=${THRESHOLD}`);
   } finally {
     child.kill("SIGTERM");
@@ -1320,9 +1402,29 @@ async function cleanup() {
   }
 }
 
+/**
+ * Remove scenarios leaked by an earlier interrupted run.
+ *
+ * Every fixture this suite creates carries a prep context beginning with
+ * "Integration fixture", and `cleanup()` deletes them — but a run that is killed
+ * (Ctrl-C, a crash, a hang) never reaches it, and a demo-owned leftover then
+ * shows up in the library labelled as a sample. Purging first makes the suite
+ * self-healing instead of quietly accumulating clutter.
+ */
+async function purgeLeakedFixtures() {
+  const removed = await db
+    .delete(scenarios)
+    .where(sql`${scenarios.prep_pack}->>'context' like 'Integration fixture%'`)
+    .returning({ id: scenarios.id });
+  if (removed.length > 0) {
+    console.log(`[integration] purged ${removed.length} scenario(s) left by an interrupted run`);
+  }
+}
+
 async function main() {
   console.log("Integration tests (real database + real server)");
   try {
+    await purgeLeakedFixtures();
     await dbTests();
     // INTEGRATION_DB_ONLY=1 skips the HTTP half (useful when the guard under
     // test lives entirely in the query layer and no rebuild is needed).

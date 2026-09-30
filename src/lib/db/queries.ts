@@ -43,9 +43,9 @@ export type DbClient = Parameters<Parameters<typeof db.transaction>[0]>[0];
  * server.
  *
  * `is_demo` is part of the public shape so the library UI can label the sample
- * scenarios and stop offering edit/delete on them, instead of letting a visitor
- * discover the read-only rule by hitting an error. It reveals nothing that the
- * library does not already show.
+ * scenarios as the built-in library rather than as the caller's own work. It is
+ * a label, not a permission: samples are editable and deletable like any other
+ * scenario. It reveals nothing that the library does not already show.
  */
 export function toPublicScenario(row: ScenarioRow): ScenarioPublic {
   return {
@@ -169,7 +169,7 @@ export async function insertScenario(values: {
  * already practised against keeps the problem it was generated with.
  *
  * A seed is part of the sample library, so it is owned by `DEMO_OWNER_ID`:
- * public to read, read-only to everyone.
+ * public to read, and editable/removable like any other scenario.
  */
 export async function upsertSeededScenario(
   seedKey: string,
@@ -1172,7 +1172,7 @@ export async function listHistory(ownerId: string | null = null): Promise<
     score: number | null;
     /** Overall score of the user's PREVIOUS attempt on the same scenario. */
     previousScore: number | null;
-    /** True for the public, read-only sample library. */
+    /** True for the public sample library (labelled, not read-only). */
     isDemo: boolean;
   }>
 > {

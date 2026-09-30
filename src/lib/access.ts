@@ -18,9 +18,16 @@ import type { AttemptRow } from "./db/queries";
  * state instead of an accident of a missing column value. The owner column is NOT
  * NULL on both tables.
  *
- * Sample rows are readable by everyone and writable by no one: they are the demo
- * library, so a visitor following a shared link can look at them, and nobody can
- * destroy them — or confuse them with their own history.
+ * Sample rows are readable by everyone (a visitor following a shared link can
+ * look at them) and, for SCENARIOS, editable and deletable like any other row:
+ * the library is the starting material a candidate practises against, so being
+ * unable to fix a seeded detail or remove a scenario you no longer want was
+ * friction, not protection. Deleting one cascades to the attempts made against
+ * it, and `npm run seed` restores the built-in library.
+ *
+ * ATTEMPTS do not follow the scenario rule: a sample call is written by nobody
+ * (there is no way to identify who ran it) and must stay immutable, so
+ * `assertAttemptAccess` keeps the old read-only rule.
  *
  * The value can never collide with a real owner id — ids are 48 hex characters
  * and this contains a `:` — so no browser can present it as its own identity.
@@ -35,9 +42,10 @@ export function isDemoOwner(ownerId: string | null | undefined): boolean {
 /**
  * How the caller means to use the row.
  *
- * Reads and writes are not the same privilege: the sample library is a public
- * artifact (a visitor can open a sample report) but a read-only one, so a write
- * to a sample is refused rather than quietly allowed.
+ * Reads and writes are not the same privilege: a sample ATTEMPT is a public
+ * artifact (a visitor can open a sample report) but an immutable one, so a write
+ * to it is refused rather than quietly allowed. Scenarios no longer make that
+ * distinction — see `assertScenarioAccess`.
  */
 export type AccessMode = "read" | "write";
 
@@ -51,16 +59,25 @@ export function assertAttemptAccess(
 }
 
 /**
- * Scenarios carry an owner for the same reason attempts do: `DELETE /scenarios/:id`
- * cascades to every attempt, event and report made against the scenario, so an
- * anonymous visitor who can list the library must not be able to destroy it.
+ * Scenarios carry an owner so a custom one stays its creator's: a foreign id
+ * 404s rather than confirming that it exists.
+ *
+ * The sample library is the deliberate exception — those rows are public to
+ * read AND to edit or delete, because they are the shared starting material the
+ * product ships with. There is no per-visitor copy to own, and refusing the
+ * write only produced a `read-only sample` error on a card the UI had already
+ * offered actions for.
  */
 export function assertScenarioAccess(
   scenario: { owner_id: string },
   ownerId: string | null,
-  mode: AccessMode = "write",
+  _mode: AccessMode = "write",
 ): void {
-  assertAccess(scenario, ownerId, "Scenario", mode);
+  if (isDemoOwner(scenario.owner_id)) return;
+  if (scenario.owner_id !== ownerId) {
+    // 404, not 403: a probe should not learn that the id exists.
+    throw new ApiError(404, "Scenario not found");
+  }
 }
 
 function assertAccess(
@@ -73,7 +90,8 @@ function assertAccess(
     if (mode === "read") return;
     // 403 here, unlike the 404 below: sample rows are public by design, so
     // acknowledging that this one exists tells the caller nothing they could not
-    // already read — and the message is what the library UI would show.
+    // already read. This is the ATTEMPT rule (a demo call has no provable
+    // author and must stay immutable); sample scenarios are editable by design.
     throw new ApiError(
       403,
       `This is a read-only sample ${label.toLowerCase()}. Create your own to experiment with it.`,

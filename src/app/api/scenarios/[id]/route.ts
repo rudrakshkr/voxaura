@@ -20,12 +20,13 @@ export const dynamic = "force-dynamic";
 /**
  * One scenario.
  *
- * Owner-scoped, like every other row in the product: the sample library is
- * public to read, a custom scenario belongs to its creator, and a foreign id
- * 404s rather than confirming that it exists. Without this the id was the whole
- * permission — anyone who could list the library could read any scenario's prep
- * pack (`context`, the coaching objective, the candidate's own target and
- * walk-away number).
+ * Owner-scoped, like every other row in the product: a custom scenario belongs
+ * to its creator and a foreign id 404s rather than confirming that it exists.
+ * The sample library is the public exception — readable by anyone, and (since it
+ * is the material the product ships with) editable and deletable by anyone too.
+ * Without this scoping the id was the whole permission — anyone who could list
+ * the library could read any scenario's prep pack (`context`, the coaching
+ * objective, the candidate's own target and walk-away number).
  */
 export const GET = handle(
   async (_req: Request, ctx: { params: Promise<{ id: string }> }) => {

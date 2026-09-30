@@ -35,6 +35,12 @@ export interface UserMoveClassification {
   commitmentSignal: boolean;
   /** Signals walking away / rejecting. */
   walkAwaySignal: boolean;
+  /**
+   * A short, plain affirmative — an answer to a question the recruiter just
+   * asked ("yes", "that's right", "confirmed"). Used to read the reply to the
+   * walk-away confirmation, where a bare "yes" means "yes, I'm declining".
+   */
+  confirmationSignal: boolean;
   /** Asks about a decision the recruiter previously deferred ("what did the team say?"). */
   decisionRequest: boolean;
   /** Talked over the recruiter (server marks separately, mirrored here). */
@@ -180,13 +186,24 @@ export function classifyUserMove(
     /we have a deal|we'?ve got a deal|sounds? like a deal|i'?m happy with|let'?s do it|let'?s (?:sign|close|finalize|wrap)|i accept|i'?ll accept|i can commit|i'?m ready to sign|works for me|deal\.?$|happy to accept|would be happy to|gladly accept|sign today|sign me up|accept (?:that|this|the) offer|i'?ll (?:just )?take\b|take what you (?:offered|are offering|proposed)|happy with (?:that|this|the offer)|i'?m in\b|okay,? deal\b|yes,? let'?s\.?$/.test(t);
 
   const walkAwaySignal =
-    /walk away|walking away|not a fit|not the right fit|go(?:ing)? with (?:the )?other|accept the other|decline|turn(?:ing)? (?:you |this )?down|not going to (?:be able to|work)|can'?t accept|cannot accept|not interested|pass on (?:this|the) (?:role|offer)|withdraw|\bor i'?m (?:out|gone)\b|\bi'?m out\b|\bi'?ll pass\b|\btake my (?:name|self) out\b|\bend (?:the|this) call\b/.test(t);
+    /walk away|walking away|not a fit|not the right fit|go(?:ing)? with (?:the )?other|accept the other|declin\w*|turn(?:ing)? (?:you |this )?down|not going to (?:be able to|work)|can'?t accept|cannot accept|not interested|pass on (?:this|the) (?:role|offer)|withdraw|\bor i'?m (?:out|gone)\b|\bi'?m out\b|\bi'?ll pass\b|\btake my (?:name|self) out\b|\bend (?:the|this) call\b/.test(t);
 
   // "What did the team say?" — the candidate is chasing a decision the
   // recruiter already promised. Must be answered, never deferred again.
   const decisionRequest =
     /what did (?:the|they|your|his|her) (?:team|leadership|committee|manager|board|vp|boss)\b|what(?:'s| is| was) the (?:decision|verdict|word|answer)\b|any (?:news|word|updates?|progress|feedback)\b|did (?:the|they|your) \w* ?(?:team|leadership|committee) (?:say|approve|get back|come back)|did you (?:hear|talk to|speak with|check)\b|come back with|following up\b|checking (?:back )?in\b|any luck\b|what'?s the latest\b|heard anything\b/.test(
       t,
+    );
+
+  // A short, standalone affirmative is an ANSWER, not a move. It only matters
+  // when the previous turn asked a question — the walk-away confirmation — so it
+  // is recorded here and acted on by the decision layer, which knows a decline
+  // is pending. Without this, "Yes, I'm sure" after "you're declining, is that
+  // right?" read as a rapport turn and the recruiter went back to negotiating.
+  const confirmationSignal =
+    text.trim().split(/\s+/).length <= 6 &&
+    /^(?:yes|yeah|yep|yup|correct|right|exactly|absolutely|definitely|sure|i am|i'?m sure|that'?s right|that is right|that'?s correct|confirmed|of course|go ahead)\b/i.test(
+      text.trim(),
     );
 
   // Primary classification precedence.
@@ -211,6 +228,7 @@ export function classifyUserMove(
     informationRequest,
     commitmentSignal,
     walkAwaySignal,
+    confirmationSignal,
     decisionRequest,
     interruption: Boolean(opts.userInterrupted),
   };
@@ -278,6 +296,31 @@ export interface EngineState {
   /** One best-and-final recovery is allowed per attempt. */
   hasRecovered: boolean;
   /**
+   * True once the recruiter has asked the candidate to confirm a walk-away.
+   * A single decline is not final on its own: it earns ONE confirmation
+   * question, and a clear yes (or a second decline) ends the call. Cleared the
+   * moment the candidate says anything that is not a decline or an answer to
+   * that question.
+   */
+  walkAwayConfirmPending: boolean;
+  /**
+   * How many turns the candidate has declined on in this call.
+   *
+   * A decline is only read as a bluff once. Declining a second time is
+   * unambiguous, so it closes the call outright rather than earning another
+   * round of "are you sure?". Without this a determined "I'm out" could be
+   * answered with questions indefinitely while the call stayed open.
+   */
+  declineCount: number;
+  /**
+   * True when the recruiter's last move put a package on the table (a counter,
+   * a trade or a recovery offer). A short "yes" after one of those is the
+   * candidate ACCEPTING it — without this context a bare "yes" read as rapport
+   * and the recruiter carried on negotiating against a candidate who had
+   * already said yes.
+   */
+  awaitingOfferReply: boolean;
+  /**
    * True when the recruiter verbally deferred to an internal team. The next
    * time the candidate asks what the team said, the engine MUST land a real
    * decision instead of deferring again.
@@ -308,8 +351,14 @@ export type RecruiterMove =
   | { kind: "probe"; question: string }
   | { kind: "recover_from_walkaway"; package: CompPackage; conditions: string[] };
 
-/** How a call ends when the recruiter has nothing left to give. */
-export type CloseOutcome = "walked_away" | "stalemate";
+/**
+ * How a call ends when the recruiter has nothing left to give.
+ *
+ * `declined` is a decline the candidate has CONFIRMED — the offer was turned
+ * down on purpose, not the numbers being dead, which is why the closing message
+ * says the offer was declined instead of "no agreement".
+ */
+export type CloseOutcome = "walked_away" | "stalemate" | "declined";
 
 /**
  * The outcome a call should end with when this move is the recruiter's last
@@ -494,7 +543,20 @@ function maxConcessionShare(hidden: HiddenState, state: EngineState): number {
   return Math.max(0.1, base + justificationBonus + leverageBonus + urgencyBonus);
 }
 
+/**
+ * The recruiter's decision, plus the one piece of bookkeeping every caller
+ * needs: whether the candidate's next short "yes" would be answering an offer
+ * (see `EngineState.awaitingOfferReply`). Kept in one wrapper so the browser,
+ * the counterfactual simulation and the tests all maintain it identically.
+ */
 export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
+  const move = decideRecruiterMoveInner(input);
+  input.state.awaitingOfferReply =
+    move.kind === "counter" || move.kind === "trade" || move.kind === "recover_from_walkaway";
+  return move;
+}
+
+function decideRecruiterMoveInner(input: DecisionInput): RecruiterMove {
   const { hidden, state, classification } = input;
   const curTotal = total(state.currentOffer);
   const envelope = packageEnvelope(hidden);
@@ -518,10 +580,38 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
   // Anything other than a yes resets the "they really want to close" counter.
   if (!classification.commitmentSignal) state.acceptAttempts = 0;
 
-  // 1. Walk-away: an empty bluff is not leverage. A recovery move has to be
-  //    earned — the candidate must already have engaged (a package has actually
-  //    moved) or brought real evidence / credible leverage.
-  if (classification.walkAwaySignal) {
+  // Is this turn a decline — or the answer to the confirmation the recruiter
+  // asked for on the previous one? A plain "yes" after "you're declining, is
+  // that right?" is a confirmation of the decline, not a new move.
+  const declinedThisTurn =
+    classification.walkAwaySignal ||
+    (state.walkAwayConfirmPending && classification.confirmationSignal);
+  // Anything else means the candidate is still negotiating: the confirmation is
+  // spent, and the next decline has to be confirmed all over again.
+  if (!declinedThisTurn) state.walkAwayConfirmPending = false;
+
+  // 1. Walk-away. A single decline is not the end of the call — it earns ONE
+  //    confirmation question — but declining twice, or answering that question
+  //    with a yes, is the candidate leaving for real, and the call closes.
+  //    The call never ends on one ambiguous sentence, and it never drags on
+  //    past a decision either.
+  if (declinedThisTurn) {
+    // Already asked, or the candidate has declined on an earlier turn: this
+    // decline is the answer, and it is final. Declining a second time is never
+    // read as a bluff again.
+    if (state.walkAwayConfirmPending || state.declineCount >= 1) {
+      return { kind: "hold_firm", final: true, close: "declined" };
+    }
+    state.declineCount = 1;
+    state.walkAwayConfirmPending = true;
+    // A recovery move has to be earned — the candidate must already have engaged
+    // (a package has actually moved) or brought real evidence / credible
+    // leverage. One best-and-final save attempt, made before the decline is
+    // taken as final.
+    //
+    // The save is deliberately NOT combined with the confirmation question: an
+    // improved offer makes a following "yes" ambiguous (take it, or confirm the
+    // decline?), so the recruiter does one or the other, never both.
     const engaged =
       state.offerCount >= 2 || state.justificationScore >= 2 || state.leverageCredibility >= 0.3;
     if (!state.hasRecovered && engaged) {
@@ -529,6 +619,10 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
       const pkg = bestSplit(hidden, state, curTotal, cap);
       if (total(pkg) - curTotal >= MIN_MOVE) {
         state.hasRecovered = true;
+        // Putting a better package forward supersedes the confirmation: the
+        // candidate's next answer is about THAT offer, not about a decline they
+        // may no longer mean.
+        state.walkAwayConfirmPending = false;
         return {
           kind: "recover_from_walkaway",
           package: pkg,
@@ -536,41 +630,43 @@ export function decideRecruiterMove(input: DecisionInput): RecruiterMove {
         };
       }
     }
-    if (state.round === 0 && !state.hasRecovered) {
-      return {
-        kind: "probe",
-        question:
-          "Before you go — what's driving this? I'd hate for us to end on a misunderstanding.",
-      };
-    }
-    // The candidate really is leaving and there is no recovery left: the call
-    // is over.
-    return { kind: "hold_firm", final: true, close: "walked_away" };
+    // No save is available: make sure they mean it before the offer is let go.
+    return {
+      kind: "probe",
+      question:
+        "I want to be sure I've understood — you're declining the offer entirely, and there's nothing further I can do to change your mind?",
+    };
   }
 
-  // 2. Acceptance: verify economics before agreeing.
-  if (classification.commitmentSignal) {
-    if (acceptsPackage(hidden, state.currentOffer)) {
+  // 2. Acceptance: a clear yes to the package ON THE TABLE closes the deal.
+  //
+  //    The candidate is entitled to say yes. Answering their acceptance with
+  //    another counter — or with a higher number — is how "I accept" came to
+  //    look broken: the deal never closed and the recruiter kept negotiating
+  //    against a candidate who had already agreed.
+  //
+  //    A short "yes" counts only when the recruiter's last move actually put a
+  //    package forward (`awaitingOfferReply`); otherwise it is an answer to some
+  //    other question and must not settle anything.
+  const accepting =
+    classification.commitmentSignal ||
+    (state.awaitingOfferReply && classification.confirmationSignal);
+  if (accepting) {
+    // The only guard left is that the company can authorize what is on the
+    // table. `state.currentOffer` can hold a package the recruiter IMPROVISED —
+    // mirrored verbatim so the panel agrees with the audio — and a figure the
+    // company never authorized cannot become the settlement.
+    if (withinPackageLimits(hidden, state.currentOffer)) {
       return { kind: "accept", package: state.currentOffer };
     }
     state.acceptAttempts += 1;
-    // A candidate who insists gets the yes. Bumping the number every time
-    // somebody says yes is not a negotiation, and refusing a genuine yes is
-    // worse than taking a modest deal — the score tells the candidate what they
-    // left behind.
-    //
-    // The yes is still bounded by the band. `state.currentOffer` can hold a
-    // package the recruiter IMPROVISED — it is mirrored verbatim so the panel
-    // agrees with the audio — and insisting must not turn a figure the company
-    // never authorized into the settlement. The deal is clamped into the hard
-    // limits before it is agreed, and the clamped figures are what the panel
-    // then shows.
+    // Insisting on a yes still gets one, clamped into the hard limits, so the
+    // deal is always one the company could actually sign.
     if (state.acceptAttempts >= 2) {
       return { kind: "accept", package: clampPackageToLimits(hidden, state.currentOffer) };
     }
-    // Premature close on a package below the bar → one real counter. Never a
-    // closing hold: the candidate is trying to say yes, so a firm "that's my
-    // best" has to leave room for them to insist.
+    // Never a closing hold: the candidate is trying to say yes, so a firm
+    // "that's my best" has to leave room for them to insist.
     const target = Math.min(offerCap, curTotal + Math.max(MIN_MOVE, Math.round(curTotal * 0.03)));
     return counterOrHold(hidden, state, target, [], false);
   }
@@ -1259,6 +1355,28 @@ function buildDirectiveInner(
 ): TurnDirective {
   switch (move.kind) {
     case "hold_firm": {
+      // A confirmed decline is its own goodbye: the candidate turned the offer
+      // down, so the recruiter accepts that, thanks them, and lets the call end.
+      // No counter, no "reconsider", no disappointment — this is the last line
+      // the candidate hears before the client hangs up.
+      if (move.close === "declined") {
+        return {
+          verdict:
+            "DECLINE CONFIRMED (final) — the candidate has confirmed they are turning the offer down. Accept the decision and close the call politely.",
+          mustSay: [
+            "Say plainly that you understand: they are declining the offer, and that is their decision.",
+            "Thank them for their time and wish them well — you are ending the call now.",
+          ],
+          mustNotSay: [
+            "Do not counter, re-open the numbers, or ask them to reconsider. The decision is final.",
+            "Do not sound bitter, cold, or personally disappointed in them.",
+          ],
+          allowedNumbers: [],
+          askUserQuestion: null,
+          conditions: [],
+          toolHint: null,
+        };
+      }
       const standing = opts.standingOffer ?? null;
       return {
         verdict: move.final
@@ -1336,7 +1454,8 @@ function buildDirectiveInner(
       return {
         verdict: "ACCEPT — the candidate's close is economically valid.",
         mustSay: [
-          "Agree warmly and confirm the final package once, using exactly these figures.",
+          "Say plainly that the offer is accepted and the deal is done, warmly and without conditions.",
+          "Confirm the final package once, using exactly these figures.",
           `Say: "${packageSentence(move.package)}"`,
           `Call accept_user_offer with final_base=${move.package.base}, sign_on=${move.package.sign_on ?? 0}, equity=${move.package.equity ?? 0}.`,
         ],

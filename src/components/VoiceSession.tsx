@@ -122,6 +122,12 @@ export function VoiceSession(props: Props) {
           title: "You walked away — the call is closed",
           body: "The negotiation ended without a deal. Your transcript is saved, and scoring shows exactly where it turned.",
         },
+        declined: {
+          frame: "border-rose-500/30 bg-rose-500/10",
+          icon: "🚪",
+          title: "Offer declined — the call is closed",
+          body: "You confirmed you're turning the offer down, so the recruiter accepted it and ended the call politely. Your transcript is saved, and scoring shows what was on the table.",
+        },
         abuse: {
           frame: "border-red-500/40 bg-red-500/10",
           icon: "⛔",
@@ -131,7 +137,7 @@ export function VoiceSession(props: Props) {
         accepted: {
           frame: "border-emerald-500/40 bg-emerald-500/10",
           icon: "🎉",
-          title: "Deal agreed — the call is closed",
+          title: "Deal accepted — the call is closed",
           body: "You and the recruiter settled on a package. Your transcript is saved, and scoring shows how strong the final numbers really were.",
         },
         stalemate: {
